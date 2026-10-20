@@ -465,14 +465,15 @@ class SecretVault:
 
     def _compile_exact_regex(self) -> None:
         """Gate 5: Sort exact-match secrets longest-first with alphanumeric lookarounds."""
-        if not self._by_secret:
-            self._exact_regex = None
-            return
-        # Sort longest-first so full secret always wins over a substring secret
-        sorted_secrets = sorted(self._by_secret.keys(), key=lambda s: -len(s))
-        escaped = [re.escape(s) for s in sorted_secrets]
-        pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(escaped) + r")(?![A-Za-z0-9_])"
-        self._exact_regex = re.compile(pattern)
+        with self._lock:
+            if not self._by_secret:
+                self._exact_regex = None
+                return
+            # Sort longest-first so full secret always wins over a substring secret
+            sorted_secrets = sorted(self._by_secret.keys(), key=lambda s: -len(s))
+            escaped = [re.escape(s) for s in sorted_secrets]
+            pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(escaped) + r")(?![A-Za-z0-9_])"
+            self._exact_regex = re.compile(pattern)
 
     def load_env_file(self, path: Path) -> int:
         """Load secrets from a .env file using the 5-Gate pipeline."""
@@ -486,24 +487,27 @@ class SecretVault:
             return 0
 
         pairs = parse_dotenv_content(content)
-        added = 0
+        candidates: List[Tuple[str, str, str]] = []
         for key, raw_val in pairs:
             for cat, secret_val in extract_secrets_from_env_pair(key, raw_val):
-                if secret_val not in self._by_secret:
-                    self.register_secret(secret_val, category=cat, source=f"{path.name}:{key}", rebuild_exact=False)
-                    added += 1
+                candidates.append((cat, secret_val, f"{path.name}:{key}"))
             # Also scan raw_val with prefix scanners in case a composite string contains an API key
             for cat, pat in PREFIX_PATTERNS:
                 for m in pat.finditer(raw_val):
-                    found = m.group(0)
-                    if found not in self._by_secret:
-                        self.register_secret(found, category=cat, source=f"{path.name}:{key}", rebuild_exact=False)
-                        added += 1
+                    candidates.append((cat, m.group(0), f"{path.name}:{key}"))
 
-        if added > 0:
-            self.vault_version += 1
-            self._compile_exact_regex()
-        return added
+        with self._lock:
+            added = 0
+            for cat, secret_val, src in candidates:
+                if secret_val not in self._by_secret:
+                    self.register_secret(secret_val, category=cat, source=src, rebuild_exact=False)
+                    added += 1
+
+            if added > 0:
+                self.vault_version += 1
+                self._message_memo.clear()
+                self._compile_exact_regex()
+            return added
 
     def load_project_dirs(self, dirs: Iterable[Path]) -> int:
         """Scan project directories for .env* files (excluding .env.example etc.)."""
@@ -534,11 +538,15 @@ class SecretVault:
 
         raw_matches: List[Tuple[int, int, SecretEntry]] = []
 
+        with self._lock:
+            exact_re = self._exact_regex
+
         # 1. Exact matches from .env vault (Gate 5 longest-first)
-        if self._exact_regex is not None:
-            for m in self._exact_regex.finditer(text):
+        if exact_re is not None:
+            for m in exact_re.finditer(text):
                 sec = m.group(0)
-                entry = self._by_secret.get(sec)
+                with self._lock:
+                    entry = self._by_secret.get(sec)
                 if entry is not None:
                     raw_matches.append((m.start(), m.end(), entry))
 
@@ -548,7 +556,8 @@ class SecretVault:
                 sec = m.group(0)
                 if any(sec.startswith(p) for p in PUBLIC_VALUE_PREFIXES):
                     continue
-                entry = self._by_secret.get(sec)
+                with self._lock:
+                    entry = self._by_secret.get(sec)
                 if entry is None:
                     # Register additively without invalidating exact_regex / prompt cache
                     entry = self.register_secret(sec, category=cat, source=f"prefix:{cat}", rebuild_exact=False)
@@ -661,4 +670,5 @@ class SecretVault:
 
     @property
     def entries(self) -> List[SecretEntry]:
-        return list(self._by_secret.values())
+        with self._lock:
+            return list(self._by_secret.values())

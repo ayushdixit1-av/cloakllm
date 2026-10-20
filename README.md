@@ -3,7 +3,7 @@
 **Audit what Claude Code already leaked in `~/.claude` — and cloak your project secrets in real time before they ever leave your machine.**
 
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#install)
-[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen)](#reproducible-benchmarks)
+[![Tests](https://img.shields.io/badge/tests-39%20passed%20%7C%208%2F8%20CI%20matrix-brightgreen)](#supported-provider-api-schemas--variant-contracts)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Every time Claude Code reads a config file, inspects test output, or runs a shell command that prints environment variables, those plaintext credentials are sent to the upstream API and persisted in `~/.claude/projects/**/*.jsonl` on disk.

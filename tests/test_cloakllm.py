@@ -1417,6 +1417,17 @@ def test_concurrent_memoization_version_interleaving() -> None:
     cached_again, _ = vault.cloak_message_memoized(msg)
     assert sec2 not in json.dumps(cached_again)
 
+    # Invariant 4 (Audit Release Gate): Direct inspection of vault._message_memo proves NO entry exists
+    # with uncloaked sec2 under any version, and every cached entry reflects start_version == vault.vault_version.
+    with vault._lock:
+        assert len(vault._message_memo) > 0
+        for (session_k, ver, digest), (cached_dict, cnt) in vault._message_memo.items():
+            cached_json = json.dumps(cached_dict)
+            assert sec1 not in cached_json, "Stale or uncloaked sec1 found in cache!"
+            assert sec2 not in cached_json, "Stale or uncloaked sec2 found in cache!"
+            assert ver == vault.vault_version, f"Cache contains outdated vault version {ver} != {vault.vault_version}"
+            assert cnt == 2
+
 
 def test_comprehensive_schema_validation_variants_and_rejections() -> None:
     """Finding 2: Exhaustive validation of supported OpenAI & Anthropic message and content variant shapes."""
@@ -1585,8 +1596,8 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
             if stop_event.is_set():
                 break
             time.sleep(0.015)
-            vault.register_secret(s, category="ANTHROPIC")
             with reg_lock:
+                vault.register_secret(s, category="ANTHROPIC")
                 registered_so_far.add(s)
 
     def reader_worker(thread_id: int):
@@ -1599,12 +1610,14 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
                 "content": f"Thread {thread_id} using {target_sec} and {initial_secrets[0]}",
             }
             try:
-                cloaked, _ = vault.cloak_message_memoized(msg)
+                # Capture known secrets prior to cloaking to ensure unambiguous sequence-ordered registration
                 with reg_lock:
-                    known = set(registered_so_far)
+                    known_before = set(registered_so_far)
 
+                cloaked, _ = vault.cloak_message_memoized(msg)
                 cloaked_str = json.dumps(cloaked)
-                if target_sec in known and target_sec in cloaked_str:
+
+                if target_sec in known_before and target_sec in cloaked_str:
                     errors.append(f"Thread {thread_id}: Leaked registered secret {target_sec} in output!")
                 if initial_secrets[0] in cloaked_str:
                     errors.append(f"Thread {thread_id}: Leaked initial secret in output!")
@@ -1620,9 +1633,12 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
         r.start()
 
     writer.join(timeout=8.0)
+    assert not writer.is_alive(), "Writer thread failed to terminate within timeout"
+
     stop_event.set()
-    for r in readers:
+    for i, r in enumerate(readers):
         r.join(timeout=4.0)
+        assert not r.is_alive(), f"Reader thread {i} failed to terminate within timeout"
 
     assert errors == [], f"Concurrency stress errors: {errors}"
 
@@ -1741,5 +1757,106 @@ def test_openai_and_anthropic_message_schema_variants_and_cloaking() -> None:
     # Non-object structured content part
     with pytest.raises(ValueError, match="must be an object"):
         cloak_request_payload({"messages": [{"role": "user", "content": [123]}]}, vault, canonical_route="/v1/chat/completions")
+
+
+def test_malformed_schema_http_boundary_fail_closed(tmp_path: Path) -> None:
+    """Audit Release Gate: Verify fail-closed HTTP boundary rejection for malformed provider schemas.
+
+    Ensures that when clients send malformed Anthropic or OpenAI payloads across the HTTP boundary:
+    1. The proxy rejects with HTTP 500 ERR_PAYLOAD_PROCESSING_FAILED (generic JSON error envelope).
+    2. The request is NEVER forwarded to the upstream server (0 upstream dispatches).
+    3. The internal exception details or raw payloads are NEVER leaked in the response.
+    4. Proxy blocked counter is incremented.
+    """
+    upstream_dispatched: list[dict] = []
+
+    class MockUpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length > 0 else b""
+            upstream_dispatched.append({"path": self.path, "body": body})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"id":"mock_ok"}')
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    up_server = ThreadingHTTPServer(("127.0.0.1", 0), MockUpstreamHandler)
+    up_thread = threading.Thread(target=up_server.serve_forever, daemon=True)
+    up_thread.start()
+    up_url = f"http://127.0.0.1:{up_server.server_port}"
+
+    vault = SecretVault(session_key=b"http-fail-closed-key-32-bytes!!")
+    logger = EventLogger(log_path=tmp_path / "events.jsonl")
+    proxy = CloakProxyServer(vault=vault, upstream_base_url=up_url, event_logger=logger)
+    base_url = proxy.start()
+    sp = urlsplit(base_url)
+
+    malformed_cases = [
+        # Anthropic: malformed base64 image (missing data)
+        (
+            f"/{proxy.url_token}/v1/messages",
+            {"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]},
+        ),
+        # Anthropic: malformed URL image (missing url)
+        (
+            f"/{proxy.url_token}/v1/messages",
+            {"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]},
+        ),
+        # Anthropic: malformed tool_result structured content (non-dict element)
+        (
+            f"/{proxy.url_token}/v1/messages",
+            {"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": ["string-instead-of-dict"]}]}]},
+        ),
+        # Anthropic: unsupported content block type
+        (
+            f"/{proxy.url_token}/v1/messages",
+            {"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": [{"type": "unknown_block", "payload": "xyz"}]}]},
+        ),
+        # OpenAI: unsupported role
+        (
+            f"/{proxy.url_token}/v1/chat/completions",
+            {"model": "gpt-4o", "messages": [{"role": "unsupported_admin_role", "content": "hi"}]},
+        ),
+        # OpenAI: tool role without required tool_call_id
+        (
+            f"/{proxy.url_token}/v1/chat/completions",
+            {"model": "gpt-4o", "messages": [{"role": "tool", "content": "output"}]},
+        ),
+        # OpenAI: malformed tool_calls (not a list)
+        (
+            f"/{proxy.url_token}/v1/chat/completions",
+            {"model": "gpt-4o", "messages": [{"role": "assistant", "tool_calls": "invalid-string"}]},
+        ),
+    ]
+
+    try:
+        initial_blocked = proxy.stats.requests_blocked
+        for path, payload in malformed_cases:
+            conn = http.client.HTTPConnection(sp.hostname, sp.port, timeout=5.0)
+            raw_body = json.dumps(payload).encode("utf-8")
+            conn.request("POST", path, body=raw_body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            conn.close()
+
+            # Invariant 1: HTTP 500 fail-closed
+            assert resp.status == 500, f"Expected 500 for {payload}, got {resp.status}"
+
+            # Invariant 2: Standard JSON error envelope without internal exception leakage
+            resp_data = json.loads(resp_body.decode("utf-8"))
+            assert resp_data["error"]["code"] == "ERR_PAYLOAD_PROCESSING_FAILED"
+            assert "traceback" not in resp_body.decode("utf-8").lower()
+
+        # Invariant 3: P0 Proof of non-forwarding - ZERO requests reached upstream mock
+        assert len(upstream_dispatched) == 0, f"Expected 0 upstream dispatches, got {len(upstream_dispatched)}"
+
+        # Invariant 4: Proxy blocked count matches number of rejected requests
+        assert proxy.stats.requests_blocked == initial_blocked + len(malformed_cases)
+    finally:
+        proxy.stop()
+        up_server.shutdown()
 
 
