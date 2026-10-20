@@ -604,9 +604,26 @@ class SecretVault:
             return new_list, total
         if isinstance(obj, dict):
             # Extended-Thinking & Signature Immunity (B1):
-            # Never touch any content block with type in ("thinking", "redacted_thinking") or "signature"
+            # Never modify cryptographically signed or thinking blocks to preserve signature integrity.
+            # Security Policy: If an unmodifiable block contains a plaintext registered secret,
+            # CloakLLM strictly refuses to forward the payload (fails closed) to guarantee zero plaintext
+            # secret transmission across ALL payload blocks!
             block_type = obj.get("type")
             if block_type in ("thinking", "redacted_thinking") or "signature" in obj:
+                def _contains_secret(o: object) -> bool:
+                    if isinstance(o, str):
+                        return len(self.scan_text(o)) > 0
+                    if isinstance(o, list):
+                        return any(_contains_secret(item) for item in o)
+                    if isinstance(o, dict):
+                        return any(_contains_secret(v) for k, v in o.items() if k != "signature")
+                    return False
+
+                if _contains_secret(obj):
+                    raise ValueError(
+                        f"Refusing to forward payload: unmodifiable block '{block_type or 'signed'}' "
+                        f"contains plaintext registered secret"
+                    )
                 return obj, 0
 
             total = 0

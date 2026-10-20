@@ -250,14 +250,24 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
     Returns `(settings_file_path, newly_added_rules)`.
     """
     if use_global:
-        settings_path = default_claude_dir() / "settings.json"
+        base = default_claude_dir()
+        settings_path = base / "settings.json"
     else:
         base = target_dir or Path.cwd()
         settings_path = base / ".claude" / "settings.json"
 
-    parent_dir = settings_path.parent
+    # 1. Comprehensive Ancestor Path Check:
+    # Walk every directory component from settings_path up to the filesystem root to reject any symlinks!
+    curr = settings_path
+    while curr != curr.parent:
+        if curr.is_symlink():
+            raise ValueError(f"Refusing to harden settings: path component '{curr}' is a symlink")
+        curr = curr.parent
 
-    # 1. Symlink defense for parent directory
+    if base.is_symlink():
+        raise ValueError(f"Refusing to harden settings: base directory '{base}' is a symlink")
+
+    parent_dir = settings_path.parent
     if parent_dir.is_symlink():
         raise ValueError(f"Refusing to harden settings: parent directory '{parent_dir}' is a symlink")
 

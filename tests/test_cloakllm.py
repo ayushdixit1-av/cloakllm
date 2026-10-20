@@ -301,12 +301,12 @@ def test_thinking_and_signature_blocks_are_never_modified() -> None:
                 "content": [
                     {
                         "type": "thinking",
-                        "thinking": f"Wait, the user has {secret} and {entry.token} in thinking.",
+                        "thinking": f"Wait, user has non-secret reasoning and {entry.token} in thinking.",
                         "signature": "ErUBCkYICBgCIkD_cryptographic_signature_must_not_break",
                     },
                     {
                         "type": "redacted_thinking",
-                        "data": f"encrypted_{secret}",
+                        "data": "encrypted_non_secret_data_blob",
                     },
                     {
                         "type": "text",
@@ -320,13 +320,31 @@ def test_thinking_and_signature_blocks_are_never_modified() -> None:
     cloaked_req, count = cloak_request_payload(request_payload, vault)
     assert count == 1
     blocks = cloaked_req["messages"][0]["content"]
-    # Thinking block with signature is 100% untouched
-    assert blocks[0]["thinking"] == f"Wait, the user has {secret} and {entry.token} in thinking."
+    # Thinking block with signature and cloaked token is 100% untouched
+    assert blocks[0]["thinking"] == f"Wait, user has non-secret reasoning and {entry.token} in thinking."
     assert blocks[0]["signature"] == "ErUBCkYICBgCIkD_cryptographic_signature_must_not_break"
     # Redacted thinking block is 100% untouched
-    assert blocks[1]["data"] == f"encrypted_{secret}"
+    assert blocks[1]["data"] == "encrypted_non_secret_data_blob"
     # Normal text block IS cloaked
     assert blocks[2]["text"] == f"Here is the normal text with {entry.token}."
+
+    # Fail-Closed Invariant: If a thinking block contains a PLAINTEXT registered secret, it MUST fail closed!
+    hostile_thinking_payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": f"Leaking plaintext secret: {secret}",
+                        "signature": "sig_hostile",
+                    }
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="contains plaintext registered secret"):
+        cloak_request_payload(hostile_thinking_payload, vault)
 
     # Also verify inbound response rehydration skips thinking blocks
     response_payload = {
@@ -2240,5 +2258,78 @@ def test_reproducible_expanded_credential_detection_benchmark(tmp_path: Path) ->
 
     fp_rate = (false_positives / len(benign_lookalike_dataset)) * 100.0
     assert false_positives == 0, f"False positives detected: {false_positives} ({fp_rate}%)"
+
+
+def test_outbound_http_boundary_rejects_secret_in_signed_thinking_block(tmp_path: Path) -> None:
+    """Release Gate Security Contract: Verify HTTP boundary fail-closed rejection for secrets in immutable blocks.
+
+    Enforces that if a client sends an outbound message containing a plaintext registered secret
+    inside an immutable block (thinking or signed block):
+    1. The proxy rejects fail-closed with HTTP 500 ERR_PAYLOAD_PROCESSING_FAILED.
+    2. The request is NEVER forwarded upstream (zero dispatches).
+    3. Plaintext registered secrets can NEVER escape loopback under any block type.
+    """
+    upstream_dispatched: list[dict] = []
+
+    class MockUpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            upstream_dispatched.append({"path": self.path})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"id":"mock_ok"}')
+
+        def log_message(self, *args) -> None:
+            return
+
+    up_server = ThreadingHTTPServer(("127.0.0.1", 0), MockUpstreamHandler)
+    up_thread = threading.Thread(target=up_server.serve_forever, daemon=True)
+    up_thread.start()
+    up_url = f"http://127.0.0.1:{up_server.server_port}"
+
+    vault = SecretVault(session_key=b"thinking-fail-closed-key-32b!!")
+    secret_val = "sk-" + "ant-api03-ThinkingSecretBoundaryTestKey123"
+    vault.register_secret(secret_val, category="ANTHROPIC")
+
+    logger = EventLogger(log_path=tmp_path / "events.jsonl")
+    proxy = CloakProxyServer(vault=vault, upstream_base_url=up_url, event_logger=logger)
+    base_url = proxy.start()
+    sp = urlsplit(base_url)
+
+    hostile_payload = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": f"Attempting leak of secret {secret_val}",
+                        "signature": "sig_cryptographic_12345",
+                    }
+                ],
+            }
+        ],
+    }
+
+    try:
+        conn = http.client.HTTPConnection(sp.hostname, sp.port, timeout=5.0)
+        body = json.dumps(hostile_payload).encode("utf-8")
+        conn.request("POST", f"/{proxy.url_token}/v1/messages", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+
+        # Invariant 1: HTTP 500 fail-closed
+        assert resp.status == 500
+        err_data = json.loads(resp_body.decode("utf-8"))
+        assert err_data["error"]["code"] == "ERR_PAYLOAD_PROCESSING_FAILED"
+
+        # Invariant 2: ZERO requests dispatched upstream!
+        assert len(upstream_dispatched) == 0, f"Upstream received: {upstream_dispatched}"
+    finally:
+        proxy.stop()
+        up_server.shutdown()
+
 
 
