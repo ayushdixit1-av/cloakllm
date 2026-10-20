@@ -1339,16 +1339,10 @@ def test_adversarial_slow_drip_body_deadline() -> None:
             except (socket.error, OSError):
                 break
 
-            # Check if server responded with 408 or closed
+            # Check if server responded with 408 or closed connection
             r, _, _ = select.select([s], [], [], 0.08)
             if r:
-                try:
-                    chunk = s.recv(4096)
-                    if chunk:
-                        resp_data += chunk
-                        break
-                except (socket.error, OSError):
-                    break
+                break
 
             if time.monotonic() - start_time > 2.0:
                 break
@@ -1357,17 +1351,16 @@ def test_adversarial_slow_drip_body_deadline() -> None:
         # Invariant: Must cut off near deadline (<= 1.5s), NOT allowed to continue for 4.0s
         assert elapsed < 2.0
 
-        # Read any remaining response bytes
-        if not resp_data:
-            s.settimeout(1.0)
-            while True:
-                try:
-                    chunk = s.recv(4096)
-                    if not chunk:
-                        break
-                    resp_data += chunk
-                except (socket.timeout, OSError):
+        # Read complete response until EOF
+        s.settimeout(2.0)
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
                     break
+                resp_data += chunk
+            except (socket.timeout, OSError):
+                break
 
         # Must return 408 Request Timeout with standard JSON error envelope
         assert b"408" in resp_data
