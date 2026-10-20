@@ -1,4 +1,4 @@
-"""Command-line interface for CloakLLM: audit, scrub, harden, run, and status."""
+"""Command-line interface for CredCloak: audit, scrub, harden, run, and status."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from cloakllm import __version__
-from cloakllm.audit import (
+from credcloak import __version__
+from credcloak.audit import (
     audit_transcripts,
     default_claude_dir,
     harden_claude_settings,
     scrub_transcripts,
 )
-from cloakllm.proxy import CloakProxyServer, EventLogger
-from cloakllm.secrets import SecretVault
+from credcloak.proxy import CloakProxyServer, EventLogger
+from credcloak.secrets import SecretVault
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
@@ -57,7 +57,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 1 if report.total_leaks > 0 else 0
 
-    print(f"CloakLLM v{__version__} -- Offline Claude Code Transcript Audit")
+    print(f"CredCloak v{__version__} -- Offline Claude Code Transcript Audit")
     print("=" * 64)
     print(f"  Transcripts scanned : {report.files_scanned} files ({report.lines_scanned:,} lines)")
     print(f"  .env secrets indexed: {report.env_secrets_loaded} high-confidence credentials")
@@ -83,9 +83,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         print(f"    ... and {len(report.findings) - 15} more occurrences.")
 
     print("\n  Next Steps:")
-    print("    1. Run `cloakllm scrub` to atomically redact transcripts in-place (0600, no .bak).")
-    print("    2. Run `cloakllm harden` to add Read(.env*) deny rules to .claude/settings.json.")
-    print("    3. Launch sessions with `cloakllm run -- claude` for live bidirectional cloaking.")
+    print("    1. Run `credcloak scrub` to atomically redact transcripts in-place (0600, no .bak).")
+    print("    2. Run `credcloak harden` to add Read(.env*) deny rules to .claude/settings.json.")
+    print("    3. Launch sessions with `credcloak run -- claude` for live bidirectional cloaking.")
     return 1
 
 
@@ -100,7 +100,7 @@ def _cmd_scrub(args: argparse.Namespace) -> int:
         extra_transcript_paths=extra_paths,
     )
     print(
-        f"CloakLLM Scrub Complete: Redacted {total_replacements} secret(s) "
+        f"CredCloak Scrub Complete: Redacted {total_replacements} secret(s) "
         f"across {files_modified} transcript file(s) (atomic 0600 replace, zero .bak files)."
     )
     return 0
@@ -110,14 +110,14 @@ def _cmd_harden(args: argparse.Namespace) -> int:
     target_dir = Path(args.dir) if args.dir else Path.cwd()
     settings_path, added = harden_claude_settings(target_dir=target_dir, use_global=args.global_settings)
     if added:
-        print(f"CloakLLM Harden: Added {len(added)} secret-file deny rule(s) to {settings_path}:")
+        print(f"CredCloak Harden: Added {len(added)} secret-file deny rule(s) to {settings_path}:")
         for r in added:
             print(f"  + {r}")
     else:
-        print(f"CloakLLM Harden: All secret-file deny rules already present in {settings_path}.")
+        print(f"CredCloak Harden: All secret-file deny rules already present in {settings_path}.")
     print(
         "Note: .claude/settings.json blocks direct Read(.env) tool calls. "
-        "Always pair with `cloakllm run -- claude` to intercept secrets emitted by Bash commands or test logs."
+        "Always pair with `credcloak run -- claude` to intercept secrets emitted by Bash commands or test logs."
     )
     return 0
 
@@ -125,7 +125,7 @@ def _cmd_harden(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     logger = EventLogger()
     if not logger.log_path.is_file():
-        print(f"No CloakLLM event log found at {logger.log_path}")
+        print(f"No CredCloak event log found at {logger.log_path}")
         return 0
 
     lines = logger.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -142,7 +142,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     rehydrated = sum(1 for e in events if e.get("event") == "rehydrated")
     blocked = sum(1 for e in events if e.get("event") in ("auth_rejected", "endpoint_blocked", "request_cloak_error"))
 
-    print(f"CloakLLM Status ({logger.log_path})")
+    print(f"CredCloak Status ({logger.log_path})")
     print("=" * 60)
     print(f"  Total logged events       : {len(events)}")
     print(f"  Outbound secrets cloaked  : {redacted}")
@@ -163,14 +163,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        print("Error: Specify a command to run, e.g. `cloakllm run -- claude`", file=sys.stderr)
+        print("Error: Specify a command to run, e.g. `credcloak run -- claude`", file=sys.stderr)
         return 2
 
     project_dirs = [Path(p) for p in args.project_dir] if args.project_dir else [Path.cwd()]
     vault = SecretVault()
     vault.load_project_dirs(project_dirs)
 
-    upstream = args.upstream or os.environ.get("CLOAKLLM_UPSTREAM_URL", "https://api.anthropic.com")
+    upstream = args.upstream or os.environ.get("CREDCLOAK_UPSTREAM_URL", os.environ.get("CLOAKLLM_UPSTREAM_URL", "https://api.anthropic.com"))
     server = CloakProxyServer(
         vault=vault,
         upstream_base_url=upstream,
@@ -193,7 +193,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         exit_code = proc.wait()
     except FileNotFoundError:
-        print(f"CloakLLM Error: Command not found: {cmd[0]}", file=sys.stderr)
+        print(f"CredCloak Error: Command not found: {cmd[0]}", file=sys.stderr)
         exit_code = 127
     finally:
         signal.signal(signal.SIGINT, old_sigint)
@@ -201,7 +201,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if not args.quiet:
         sys.stderr.write(
-            f"[CloakLLM] Session closed -- {server.stats.secrets_redacted_outbound} outbound secret(s) cloaked, "
+            f"[CredCloak] Session closed -- {server.stats.secrets_redacted_outbound} outbound secret(s) cloaked, "
             f"{server.stats.tokens_rehydrated_inbound} inbound token(s) rehydrated.\n"
         )
     return exit_code
@@ -209,13 +209,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cloakllm",
+        prog="credcloak",
         description=(
-            "CloakLLM: Local-first secret & credential firewall for Claude Code. "
+            "CredCloak: Local-first secret & credential firewall for Claude Code. "
             "Audit and scrub ~/.claude transcripts offline, and cloak secrets in real time."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"cloakllm {__version__}")
+    parser.add_argument("--version", action="version", version=f"credcloak {__version__}")
     sub = parser.add_subparsers(dest="subcommand")
 
     # audit
@@ -237,11 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_harden.add_argument("--dir", help="Target project directory (default: current working directory)")
 
     # status
-    p_status = sub.add_parser("status", help="Inspect ~/.cloakllm/events.jsonl metrics and recent events")
+    p_status = sub.add_parser("status", help="Inspect ~/.credcloak/events.jsonl metrics and recent events")
     p_status.add_argument("--tail", type=int, default=10, help="Number of recent events to display")
 
     # run
-    p_run = sub.add_parser("run", help="Run a command (e.g. `cloakllm run -- claude`) behind the fail-closed cloaking proxy")
+    p_run = sub.add_parser("run", help="Run a command (e.g. `credcloak run -- claude`) behind the fail-closed cloaking proxy")
     p_run.add_argument("--upstream", help="Upstream API base URL (default: https://api.anthropic.com)")
     p_run.add_argument("--project-dir", action="append", help="Project directory with .env files to load")
     p_run.add_argument(

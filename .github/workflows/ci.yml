@@ -73,11 +73,11 @@ jobs:
           python -m venv test_env
           source test_env/bin/activate
           pip install dist/*.whl
-          cloakllm --version
-          cloakllm audit --help
-          cloakllm scrub --help
-          cloakllm harden --help
-          cloakllm status --help
-          cloakllm run --help
+          credcloak --version
+          credcloak audit --help
+          credcloak scrub --help
+          credcloak harden --help
+          credcloak status --help
+          credcloak run --help
           pip install ".[proxy]"
           deactivate

@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from cloakllm.secrets import SecretVault
+from credcloak.secrets import SecretVault
 
 # ---------------------------------------------------------------------------
 # Token Matchers (C2: 128-bit / 32-hex tag, C3: Exact-Only Resolution)

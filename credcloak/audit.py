@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from cloakllm.secrets import SecretEntry, SecretVault
+from credcloak.secrets import SecretEntry, SecretVault
 
 
 def mask_secret_preview(secret: str) -> str:
@@ -206,7 +206,7 @@ def scrub_transcripts(
 
         if file_replacements > 0:
             # Atomic write in same directory with 0600 permissions and zero .bak retention
-            fd, tmp_name = tempfile.mkstemp(dir=str(tf.parent), prefix=".cloakllm_scrub_", suffix=".tmp")
+            fd, tmp_name = tempfile.mkstemp(dir=str(tf.parent), prefix=".credcloak_scrub_", suffix=".tmp")
             tmp_path = Path(tmp_name)
             try:
                 try:
@@ -311,7 +311,7 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
 
     # 3. Safe atomic write with 0600 permissions and zero .bak retention
     content = json.dumps(data, indent=2) + "\n"
-    fd, tmp_name = tempfile.mkstemp(dir=str(parent_dir), prefix=".cloakllm_harden_", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=str(parent_dir), prefix=".credcloak_harden_", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
         try:

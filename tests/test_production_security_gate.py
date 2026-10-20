@@ -1,4 +1,4 @@
-"""Production Security Release Gate Verification Suite for CloakLLM.
+"""Production Security Release Gate Verification Suite for CredCloak.
 
 Tests the four fundamental security invariants required for unconditional production security sign-off:
 1. Outbound Boundary Invariant: Registered secrets CANNOT cross the proxy boundary in plaintext
@@ -27,10 +27,10 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from cloakllm.audit import harden_claude_settings, scrub_transcripts
-from cloakllm.proxy import CloakProxyServer, cloak_request_payload
-from cloakllm.secrets import SecretVault
-from cloakllm.stream import StreamRehydrator
+from credcloak.audit import harden_claude_settings, scrub_transcripts
+from credcloak.proxy import CloakProxyServer, cloak_request_payload
+from credcloak.secrets import SecretVault
+from credcloak.stream import StreamRehydrator
 
 
 class InstrumentedRecordingUpstream:

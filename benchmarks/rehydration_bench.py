@@ -1,4 +1,4 @@
-"""Reproducible benchmark suite for CloakLLM:
+"""Reproducible benchmark suite for CredCloak:
 1. 5-Gate .env Precision & False-Positive Rate
 2. 200-Case Streaming & Tool-Call Rehydration Survival Benchmark
 3. 100k-Token Multi-Turn Memoization Latency Benchmark
@@ -10,9 +10,9 @@ import json
 import time
 from typing import List, Tuple
 
-from cloakllm.proxy import cloak_request_payload
-from cloakllm.secrets import SecretVault, extract_secrets_from_env_pair
-from cloakllm.stream import StreamRehydrator, rehydrate_text_fragment
+from credcloak.proxy import cloak_request_payload
+from credcloak.secrets import SecretVault, extract_secrets_from_env_pair
+from credcloak.stream import StreamRehydrator, rehydrate_text_fragment
 
 
 def run_env_gate_benchmark() -> dict:

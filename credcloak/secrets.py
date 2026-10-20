@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 # ---------------------------------------------------------------------------
 # Threat Model & Design Invariants (Finding J)
 # ---------------------------------------------------------------------------
-# CloakLLM is a local-first credential firewall protecting REGISTERED project
+# CredCloak is a local-first credential firewall protecting REGISTERED project
 # credentials (indexed from .env files and recognized high-confidence API prefixes).
 # It does NOT guarantee heuristic detection of arbitrary unindexed strings.
 # ---------------------------------------------------------------------------
@@ -606,7 +606,7 @@ class SecretVault:
             # Extended-Thinking & Signature Immunity (B1):
             # Never modify cryptographically signed or thinking blocks to preserve signature integrity.
             # Security Policy: If an unmodifiable block contains a plaintext registered secret,
-            # CloakLLM strictly refuses to forward the payload (fails closed) to guarantee zero plaintext
+            # CredCloak strictly refuses to forward the payload (fails closed) to guarantee zero plaintext
             # secret transmission across ALL payload blocks!
             block_type = obj.get("type")
             if block_type in ("thinking", "redacted_thinking") or "signature" in obj:

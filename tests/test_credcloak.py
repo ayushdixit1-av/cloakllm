@@ -1,4 +1,4 @@
-"""Comprehensive test suite for CloakLLM covering B1-B6 pre-build audit requirements."""
+"""Comprehensive test suite for CredCloak covering B1-B6 pre-build audit requirements."""
 
 from __future__ import annotations
 
@@ -15,19 +15,19 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from cloakllm.audit import (
+from credcloak.audit import (
     audit_transcripts,
     harden_claude_settings,
     mask_secret_preview,
     scrub_transcripts,
 )
-from cloakllm.proxy import CloakProxyServer, EventLogger, cloak_request_payload
-from cloakllm.secrets import (
+from credcloak.proxy import CloakProxyServer, EventLogger, cloak_request_payload
+from credcloak.secrets import (
     SecretVault,
     extract_secrets_from_env_pair,
     parse_dotenv_content,
 )
-from cloakllm.stream import (
+from credcloak.stream import (
     StreamRehydrator,
     is_viable_token_prefix,
     rehydrate_json_value,
@@ -1193,7 +1193,7 @@ def test_bounded_server_thread_startup_failure_release() -> None:
     """Verify BoundedThreadingHTTPServer releases semaphore and closes socket if thread startup fails."""
     from unittest.mock import patch
     from http.server import BaseHTTPRequestHandler
-    from cloakllm.proxy import BoundedThreadingHTTPServer
+    from credcloak.proxy import BoundedThreadingHTTPServer
 
     server = BoundedThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler, max_connections=2)
     fake_sock = socket.socket()
@@ -1212,7 +1212,7 @@ def test_bounded_server_thread_startup_failure_release() -> None:
 
 def test_openai_structured_system_content_preservation() -> None:
     """Verify that OpenAI structured system message content (list of parts) is not converted to a string."""
-    from cloakllm.proxy import SYSTEM_PRESERVATION_HINT
+    from credcloak.proxy import SYSTEM_PRESERVATION_HINT
 
     vault = SecretVault(session_key=b"openai-structured-system-test-key")
     sec = "sk-ant-api03-StructuredSystemSecret99"

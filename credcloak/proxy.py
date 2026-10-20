@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
-from cloakllm.secrets import SecretVault
-from cloakllm.stream import StreamRehydrator, rehydrate_json_value
+from credcloak.secrets import SecretVault
+from credcloak.stream import StreamRehydrator, rehydrate_json_value
 
 SYSTEM_PRESERVATION_HINT = (
     "Tokens matching CLOAKv1_<CATEGORY>_<32HEX> are opaque credential placeholders. "
@@ -580,7 +580,7 @@ class EventLogger:
     """Append-only 0600 JSONL event logger with structured allowlisted schema (C4, D)."""
 
     def __init__(self, log_path: Optional[Path] = None) -> None:
-        base_dir = Path(os.environ.get("CLOAKLLM_HOME", str(Path.home() / ".cloakllm")))
+        base_dir = Path(os.environ.get("CREDCLOAK_HOME", os.environ.get("CLOAKLLM_HOME", str(Path.home() / ".credcloak"))))
         if base_dir.is_symlink():
             raise PermissionError(f"Log directory cannot be a symbolic link: {base_dir}")
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -860,7 +860,7 @@ class CloakProxyServer:
             {
                 "type": "error",
                 "error": {
-                    "type": "cloakllm_proxy_error",
+                    "type": "credcloak_proxy_error",
                     "code": error_code,
                     "message": generic_message,
                 },
