@@ -32,7 +32,7 @@ credcloak audit
 ```
 
 ```text
-CredCloak v0.1.0 -- Offline Claude Code Transcript Audit
+CredCloak v1.0.0-rc.1 -- Offline Claude Code Transcript Audit
 ================================================================
   Transcripts scanned : 14 files (8,412 lines)
   .env secrets indexed: 9 high-confidence credentials

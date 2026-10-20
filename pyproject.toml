@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "credcloak"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Zero-dependency local credential firewall for Claude Code: audit transcripts and run with reversible, fail-closed secret cloaking."
 readme = "README.md"
 requires-python = ">=3.10"

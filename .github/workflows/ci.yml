@@ -67,18 +67,30 @@ jobs:
           echo "### Release Artifact Checksums & Reproducibility" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact | SHA-256 (Build 1) | Size | Rebuild Match |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          MISMATCH=0
           for f in dist/*; do
             NAME=$(basename "$f")
+            if [ ! -f "dist_rebuild/$NAME" ]; then
+              echo "::error::Missing artifact in rebuild: dist_rebuild/$NAME"
+              exit 1
+            fi
             HASH1=$(sha256sum "dist/$NAME" | cut -d' ' -f1)
             HASH2=$(sha256sum "dist_rebuild/$NAME" | cut -d' ' -f1)
             SIZE=$(stat -c%s "dist/$NAME")
             if [ "$HASH1" = "$HASH2" ]; then
               MATCH="PASSED (Deterministic)"
+              echo "PASS: $NAME matches byte-for-byte across builds ($HASH1)"
             else
-              MATCH="Differences detected"
+              MATCH="FAILED (Checksum Mismatch)"
+              echo "::error::Hash mismatch for $NAME: Build 1 ($HASH1) != Build 2 ($HASH2)"
+              MISMATCH=1
             fi
             echo "| \`$NAME\` | \`$HASH1\` | $SIZE bytes | $MATCH |" >> $GITHUB_STEP_SUMMARY
           done
+          if [ "$MISMATCH" -ne 0 ]; then
+            echo "::error::Reproducibility release gate failed: rebuild produced non-identical hashes"
+            exit 1
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
