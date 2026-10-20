@@ -1927,6 +1927,14 @@ def test_harden_claude_settings_symlink_rejection_and_atomic_replace(tmp_path: P
     with pytest.raises(ValueError, match="parent directory .* is a symlink"):
         harden_claude_settings(target_dir=proj_dir_2)
 
+    # 2b. Reject symlinked ancestor / base directory
+    proj_dir_3_real = tmp_path / "real_proj3"
+    proj_dir_3_real.mkdir()
+    proj_dir_3_symlink = tmp_path / "symlink_proj3"
+    proj_dir_3_symlink.symlink_to(proj_dir_3_real)
+    with pytest.raises(ValueError, match="(ancestor|base) directory .* is a symlink"):
+        harden_claude_settings(target_dir=proj_dir_3_symlink)
+
     # 3. Verify normal atomic hardening succeeds and writes 0600
     settings_file, added = harden_claude_settings(target_dir=proj_dir)
     assert settings_file.is_file()
@@ -2133,7 +2141,9 @@ def test_adversarial_proxy_bypass_and_alternate_destinations(tmp_path: Path) -> 
     try:
         for method, path, expected_status in bypass_attempts:
             conn = http.client.HTTPConnection(sp.hostname, sp.port, timeout=5.0)
-            conn.request(method, path, body=b"{}", headers={"Content-Type": "application/json"})
+            req_body = None if method in ("GET", "DELETE") else b"{}"
+            req_headers = {"Content-Type": "application/json"} if req_body is not None else {}
+            conn.request(method, path, body=req_body, headers=req_headers)
             resp = conn.getresponse()
             resp.read()
             conn.close()

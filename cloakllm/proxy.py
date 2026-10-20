@@ -865,6 +865,18 @@ class CloakProxyServer:
                 },
             }
         ).encode("utf-8")
+        # If the request body has not yet been read, drain up to 64KB so TCP shutdown does not send RST on Windows
+        if not getattr(handler, "_body_read", False):
+            try:
+                cl_header = handler.headers.get("Content-Length")
+                if cl_header:
+                    cl = int(cl_header)
+                    if 0 < cl <= 65536:
+                        handler.rfile.read(cl)
+            except Exception:
+                pass
+            handler._body_read = True
+
         try:
             handler.send_response(status)
             handler.send_header("Content-Type", "application/json")
@@ -1187,6 +1199,7 @@ class CloakProxyServer:
                 return
         else:
             raw_body = b""
+        handler._body_read = True
 
         # 6. Cloak Request Payload (Fail Closed without Leaking Exceptions!) (Section 2.D)
         is_streaming_request = False

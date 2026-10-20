@@ -261,7 +261,9 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
     curr = settings_path
     while curr != curr.parent:
         if curr.is_symlink():
-            raise ValueError(f"Refusing to harden settings: path component '{curr}' is a symlink")
+            if curr == settings_path.parent:
+                raise ValueError(f"Refusing to harden settings: parent directory '{curr}' is a symlink")
+            raise ValueError(f"Refusing to harden settings: ancestor directory '{curr}' is a symlink")
         curr = curr.parent
 
     if base.is_symlink():
