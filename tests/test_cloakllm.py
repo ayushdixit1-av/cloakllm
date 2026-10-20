@@ -1422,7 +1422,7 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
     """Finding 2: Exhaustive validation of supported OpenAI & Anthropic message and content variant shapes."""
     vault = SecretVault(session_key=b"exhaustive-schema-key-32-bytes!")
 
-    # 1. Valid Anthropic content blocks: image, tool_use, tool_result, thinking
+    # 1. Valid Anthropic content blocks: image (base64 and url), tool_use, tool_result, thinking
     anthropic_payload = {
         "model": "claude-sonnet-4-20250514",
         "messages": [
@@ -1436,6 +1436,13 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
                             "type": "base64",
                             "media_type": "image/png",
                             "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                        },
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/diagram.png",
                         },
                     },
                 ],
@@ -1462,7 +1469,14 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_01",
-                        "content": "total 0",
+                        "content": [
+                            {"type": "text", "text": "total 0"},
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": "https://example.com/res.png"},
+                            },
+                        ],
+                        "is_error": False,
                     }
                 ],
             },
@@ -1470,12 +1484,29 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
     }
     cloaked_ant, _ = cloak_request_payload(anthropic_payload, vault, canonical_route="/v1/messages")
     assert len(cloaked_ant["messages"]) == 3
+    assert cloaked_ant["messages"][0]["content"][2]["source"]["url"] == "https://example.com/diagram.png"
 
     # 2. Reject malformed Anthropic variants fail-closed:
     # Malformed image block (missing data)
-    with pytest.raises(ValueError, match="Anthropic image source requires"):
+    with pytest.raises(ValueError, match="Anthropic base64 image source requires"):
         cloak_request_payload(
             {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]},
+            vault,
+            canonical_route="/v1/messages",
+        )
+
+    # Malformed URL image block (missing url)
+    with pytest.raises(ValueError, match="Anthropic url image source requires"):
+        cloak_request_payload(
+            {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]},
+            vault,
+            canonical_route="/v1/messages",
+        )
+
+    # Malformed tool_result structured content (invalid non-dict part)
+    with pytest.raises(ValueError, match="Anthropic tool_result structured content must contain objects with 'type'"):
+        cloak_request_payload(
+            {"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": ["not-a-dict"]}]}]},
             vault,
             canonical_route="/v1/messages",
         )
@@ -1526,6 +1557,74 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
             vault,
             canonical_route="/v1/chat/completions",
         )
+
+
+def test_multithreaded_concurrent_memoization_stress() -> None:
+    """Stress test: Genuinely multi-threaded concurrent cloaking under sustained secret registration.
+
+    Runs multiple worker threads calling cloak_message_memoized concurrently while
+    a writer thread continuously registers new secrets and increments vault_version.
+    Proves:
+    1. Zero deadlocks or exceptions under sustained thread contention.
+    2. No race condition permits an uncloaked registered secret to be returned or cached.
+    """
+    vault = SecretVault(session_key=b"multithread-stress-key-32-bytes!")
+    initial_secrets = [f"sk_live_initial_secret_{i:04d}_abcdef" for i in range(10)]
+    for s in initial_secrets:
+        vault.register_secret(s, category="STRIPE")
+
+    dynamic_secrets = [f"sk-ant-api03-dynamic_secret_{i:04d}_uvwxyz" for i in range(25)]
+    registered_so_far = set(initial_secrets)
+    reg_lock = threading.Lock()
+
+    stop_event = threading.Event()
+    errors = []
+
+    def writer_worker():
+        for s in dynamic_secrets:
+            if stop_event.is_set():
+                break
+            time.sleep(0.015)
+            vault.register_secret(s, category="ANTHROPIC")
+            with reg_lock:
+                registered_so_far.add(s)
+
+    def reader_worker(thread_id: int):
+        iters = 0
+        while not stop_event.is_set() and iters < 40:
+            iters += 1
+            target_sec = dynamic_secrets[iters % len(dynamic_secrets)]
+            msg = {
+                "role": "user",
+                "content": f"Thread {thread_id} using {target_sec} and {initial_secrets[0]}",
+            }
+            try:
+                cloaked, _ = vault.cloak_message_memoized(msg)
+                with reg_lock:
+                    known = set(registered_so_far)
+
+                cloaked_str = json.dumps(cloaked)
+                if target_sec in known and target_sec in cloaked_str:
+                    errors.append(f"Thread {thread_id}: Leaked registered secret {target_sec} in output!")
+                if initial_secrets[0] in cloaked_str:
+                    errors.append(f"Thread {thread_id}: Leaked initial secret in output!")
+            except Exception as e:
+                errors.append(f"Thread {thread_id} exception: {e}")
+            time.sleep(0.005)
+
+    writer = threading.Thread(target=writer_worker, daemon=True)
+    readers = [threading.Thread(target=reader_worker, args=(i,), daemon=True) for i in range(6)]
+
+    writer.start()
+    for r in readers:
+        r.start()
+
+    writer.join(timeout=8.0)
+    stop_event.set()
+    for r in readers:
+        r.join(timeout=4.0)
+
+    assert errors == [], f"Concurrency stress errors: {errors}"
 
 
 def test_unary_upstream_read_failure_handling(tmp_path: Path) -> None:

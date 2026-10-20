@@ -140,11 +140,33 @@ CloakLLM is designed as a local developer firewall and transcript hygiene utilit
 4. **Non-Goals (String Transformations)**: If a prompt explicitly asks the LLM to output credentials in Base64, hex, rot13, or character-sliced form, the transformed token will not match the token grammar and will remain in its placeholder state.
 5. **Local Multi-User Environment**: CloakLLM binds to loopback (`127.0.0.1`) and uses a per-run random path capability token. On shared multi-user Unix machines where untrusted users can inspect process environment tables (`ps e`) or loopback traffic, use standard OS-level user namespace isolation.
 
----
+## Supported Provider API Schemas & Variant Contracts
 
-## License
+CloakLLM strictly validates and parses supported payload structures for the following provider routes:
 
-MIT
+### 1. Anthropic Messages API (`/v1/messages`, `/v1/messages/count_tokens`)
+- **Roles**: `user`, `assistant`.
+- **System Prompts**: Top-level `system` string or list of text blocks (`{"type": "text", "text": "..."}`).
+- **Content Blocks**:
+  - `text`: Plain text blocks (`text: str`).
+  - `image`: Visual inputs supporting both `source.type == "base64"` (`media_type`, `data`) and `source.type == "url"` (`url: str`).
+  - `tool_use`: Model-invoked tool calls (`id: str`, `name: str`, `input: dict`).
+  - `tool_result`: Local execution results (`tool_use_id: str`, optional `content` as string or list of text/image blocks, optional `is_error: bool`).
+  - `thinking` & `redacted_thinking`: Extended reasoning blocks (`thinking`, `signature`, `data`), immune to cloaking/rehydration modification to preserve cryptographic signatures.
+- **Streaming**: Server-Sent Events (`text_delta`, `input_json_delta`) with grammar-driven hold-back buffer across multi-byte UTF-8, JSON escape (`\u005f`), and markdown escape (`\_`) sequences.
+
+### 2. OpenAI Chat Completions API (`/v1/chat/completions`)
+- **Roles**: `system`, `developer`, `user`, `assistant`, `tool`, `function`.
+- **Content Variants**:
+  - String content across all message roles.
+  - Structured parts: `text` (`text: str`), `image_url` (string URL or `{"url": str, "detail": ...}`), and `input_audio` (`data: str`, `format: str`).
+  - Null `content`: Permitted for assistant messages specifying `tool_calls` or `function_call`.
+- **Tool Calling**:
+  - `tool_calls`: List of objects with `id: str`, `type: "function"`, and `function: {"name": str, "arguments": str}`.
+  - `function_call`: Legacy function calling (`name: str`, `arguments: str`).
+  - `tool`: Tool response messages requiring string `tool_call_id`.
+  - `function`: Legacy response messages requiring string `name`.
+- **Fail-Closed Contract**: Any role or content block outside this supported matrix is rejected fail-closed with generic JSON error envelopes (`ERR_PAYLOAD_PROCESSING_FAILED`), preventing malformed payload bypass.
 
 ---
 

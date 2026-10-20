@@ -187,8 +187,15 @@ def validate_anthropic_message(m: dict) -> None:
                 if "source" not in part or not isinstance(part["source"], dict):
                     raise ValueError("Anthropic image block requires 'source' object")
                 src = part["source"]
-                if src.get("type") != "base64" or not isinstance(src.get("media_type"), str) or not isinstance(src.get("data"), str):
-                    raise ValueError("Anthropic image source requires type 'base64', string media_type, and data")
+                src_type = src.get("type")
+                if src_type == "base64":
+                    if not isinstance(src.get("media_type"), str) or not isinstance(src.get("data"), str):
+                        raise ValueError("Anthropic base64 image source requires string 'media_type' and 'data'")
+                elif src_type == "url":
+                    if "url" not in src or not isinstance(src.get("url"), str):
+                        raise ValueError("Anthropic url image source requires string 'url'")
+                else:
+                    raise ValueError(f"Anthropic image source type must be 'base64' or 'url', got '{src_type}'")
             elif b_type == "tool_use":
                 if "id" not in part or not isinstance(part["id"], str):
                     raise ValueError("Anthropic tool_use block requires string 'id'")
@@ -199,6 +206,37 @@ def validate_anthropic_message(m: dict) -> None:
             elif b_type == "tool_result":
                 if "tool_use_id" not in part or not isinstance(part["tool_use_id"], str):
                     raise ValueError("Anthropic tool_result block requires string 'tool_use_id'")
+                if "content" in part and part["content"] is not None:
+                    tr_content = part["content"]
+                    if isinstance(tr_content, str):
+                        pass
+                    elif isinstance(tr_content, list):
+                        for sub_part in tr_content:
+                            if not isinstance(sub_part, dict) or "type" not in sub_part:
+                                raise ValueError("Anthropic tool_result structured content must contain objects with 'type'")
+                            sub_type = sub_part["type"]
+                            if sub_type == "text":
+                                if "text" not in sub_part or not isinstance(sub_part["text"], str):
+                                    raise ValueError("Anthropic tool_result text part requires string 'text'")
+                            elif sub_type == "image":
+                                if "source" not in sub_part or not isinstance(sub_part["source"], dict):
+                                    raise ValueError("Anthropic tool_result image part requires 'source' object")
+                                sub_src = sub_part["source"]
+                                sub_src_type = sub_src.get("type")
+                                if sub_src_type == "base64":
+                                    if not isinstance(sub_src.get("media_type"), str) or not isinstance(sub_src.get("data"), str):
+                                        raise ValueError("Anthropic tool_result base64 image requires string 'media_type' and 'data'")
+                                elif sub_src_type == "url":
+                                    if "url" not in sub_src or not isinstance(sub_src.get("url"), str):
+                                        raise ValueError("Anthropic tool_result url image requires string 'url'")
+                                else:
+                                    raise ValueError("Anthropic tool_result image source requires type 'base64' or 'url'")
+                            else:
+                                raise ValueError(f"Unsupported Anthropic tool_result sub-content type: '{sub_type}'")
+                    else:
+                        raise ValueError(f"Anthropic tool_result content must be string or list of blocks, got {type(tr_content).__name__}")
+                if "is_error" in part and not isinstance(part["is_error"], bool):
+                    raise ValueError("Anthropic tool_result 'is_error' must be a boolean")
             elif b_type == "thinking":
                 if "thinking" not in part or not isinstance(part["thinking"], str) or "signature" not in part or not isinstance(part["signature"], str):
                     raise ValueError("Anthropic thinking block requires string 'thinking' and 'signature'")
