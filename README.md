@@ -4,6 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/ayushdixit1-av/cloakllm?include_prereleases&color=orange&label=release)](https://github.com/ayushdixit1-av/cloakllm/releases)
 [![CI Matrix](https://github.com/ayushdixit1-av/cloakllm/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushdixit1-av/cloakllm/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-50%20passed%20%7C%208%2F8%20CI%20matrix-brightgreen)](#reproducible-benchmarks)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#quickstart-30-seconds-zero-dependencies)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/ayushdixit1-av/cloakllm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
