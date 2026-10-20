@@ -71,7 +71,11 @@ ANTHROPIC_ALLOWED_ROLES = {"user", "assistant"}
 
 
 def validate_openai_message(m: dict) -> None:
-    """Validate OpenAI chat completion message schema variants strictly."""
+    """Validate OpenAI chat completion message schema variants strictly per API specification.
+
+    Supported roles: system, developer, user, assistant, tool, function.
+    Validates all required fields, sub-structures (tool_calls, function_call), and content shapes.
+    """
     if not isinstance(m, dict):
         raise ValueError("OpenAI message must be a JSON object")
     if "role" not in m or not isinstance(m.get("role"), str):
@@ -79,6 +83,9 @@ def validate_openai_message(m: dict) -> None:
     role = m["role"]
     if role not in OPENAI_ALLOWED_ROLES:
         raise ValueError(f"OpenAI message role '{role}' is not supported")
+
+    if "name" in m and not isinstance(m["name"], str):
+        raise ValueError("OpenAI message 'name' must be a string")
 
     content = m.get("content")
     if content is not None:
@@ -89,12 +96,30 @@ def validate_openai_message(m: dict) -> None:
                 if not isinstance(part, dict) or "type" not in part or not isinstance(part.get("type"), str):
                     raise ValueError("OpenAI structured content part must be an object with string 'type'")
                 part_type = part["type"]
-                if part_type == "text" and "text" in part and not isinstance(part["text"], str):
-                    raise ValueError("OpenAI text content part must contain string 'text'")
+                if part_type == "text":
+                    if "text" not in part or not isinstance(part["text"], str):
+                        raise ValueError("OpenAI text content part must contain string 'text'")
+                elif part_type == "image_url":
+                    if "image_url" not in part:
+                        raise ValueError("OpenAI image_url part must contain 'image_url'")
+                    iu = part["image_url"]
+                    if isinstance(iu, dict):
+                        if "url" not in iu or not isinstance(iu["url"], str):
+                            raise ValueError("OpenAI image_url object must contain string 'url'")
+                    elif not isinstance(iu, str):
+                        raise ValueError("OpenAI image_url must be string or object with url")
+                elif part_type == "input_audio":
+                    if "input_audio" not in part or not isinstance(part["input_audio"], dict):
+                        raise ValueError("OpenAI input_audio part must contain object 'input_audio'")
+                    ia = part["input_audio"]
+                    if "data" not in ia or not isinstance(ia["data"], str) or "format" not in ia or not isinstance(ia["format"], str):
+                        raise ValueError("OpenAI input_audio must contain string 'data' and string 'format'")
+                else:
+                    raise ValueError(f"Unsupported OpenAI content part type: '{part_type}'")
         else:
             raise ValueError(f"OpenAI message content must be string, list of parts, or null, got {type(content).__name__}")
     else:
-        # Null content allowed for assistant (e.g. tool_calls) or function
+        # Null content allowed only for assistant (with tool_calls/function_call) or function
         if role not in ("assistant", "function"):
             raise ValueError(f"OpenAI message role '{role}' requires non-null content")
 
@@ -103,13 +128,28 @@ def validate_openai_message(m: dict) -> None:
         if not isinstance(tc, list):
             raise ValueError("OpenAI message 'tool_calls' must be a list")
         for item in tc:
-            if not isinstance(item, dict) or "type" not in item:
-                raise ValueError("OpenAI tool_call must be an object with 'type'")
-            if "function" in item and not isinstance(item["function"], dict):
-                raise ValueError("OpenAI tool_call 'function' must be an object")
+            if not isinstance(item, dict):
+                raise ValueError("OpenAI tool_call must be a JSON object")
+            if "id" not in item or not isinstance(item["id"], str):
+                raise ValueError("OpenAI tool_call requires string 'id'")
+            if "type" not in item or item["type"] != "function":
+                raise ValueError("OpenAI tool_call requires type 'function'")
+            if "function" not in item or not isinstance(item["function"], dict):
+                raise ValueError("OpenAI tool_call requires 'function' object")
+            fn = item["function"]
+            if "name" not in fn or not isinstance(fn["name"], str):
+                raise ValueError("OpenAI tool_call function requires string 'name'")
+            if "arguments" not in fn or not isinstance(fn["arguments"], str):
+                raise ValueError("OpenAI tool_call function requires string 'arguments'")
 
-    if "function_call" in m and not isinstance(m["function_call"], dict):
-        raise ValueError("OpenAI message 'function_call' must be an object")
+    if "function_call" in m:
+        fc = m["function_call"]
+        if not isinstance(fc, dict):
+            raise ValueError("OpenAI message 'function_call' must be an object")
+        if "name" not in fc or not isinstance(fc["name"], str):
+            raise ValueError("OpenAI function_call requires string 'name'")
+        if "arguments" not in fc or not isinstance(fc["arguments"], str):
+            raise ValueError("OpenAI function_call requires string 'arguments'")
 
     if role == "tool" and ("tool_call_id" not in m or not isinstance(m["tool_call_id"], str)):
         raise ValueError("OpenAI 'tool' message requires string 'tool_call_id'")
@@ -119,7 +159,11 @@ def validate_openai_message(m: dict) -> None:
 
 
 def validate_anthropic_message(m: dict) -> None:
-    """Validate Anthropic messages schema variants strictly."""
+    """Validate Anthropic messages schema variants strictly per API specification.
+
+    Supported roles: user, assistant.
+    Validates text, image, tool_use, tool_result, thinking, and redacted_thinking content blocks.
+    """
     if not isinstance(m, dict):
         raise ValueError("Anthropic message must be a JSON object")
     if "role" not in m or not isinstance(m.get("role"), str):
@@ -135,6 +179,34 @@ def validate_anthropic_message(m: dict) -> None:
         for part in content:
             if not isinstance(part, dict) or "type" not in part or not isinstance(part.get("type"), str):
                 raise ValueError("Anthropic content block must be an object with string 'type'")
+            b_type = part["type"]
+            if b_type == "text":
+                if "text" not in part or not isinstance(part["text"], str):
+                    raise ValueError("Anthropic text block requires string 'text'")
+            elif b_type == "image":
+                if "source" not in part or not isinstance(part["source"], dict):
+                    raise ValueError("Anthropic image block requires 'source' object")
+                src = part["source"]
+                if src.get("type") != "base64" or not isinstance(src.get("media_type"), str) or not isinstance(src.get("data"), str):
+                    raise ValueError("Anthropic image source requires type 'base64', string media_type, and data")
+            elif b_type == "tool_use":
+                if "id" not in part or not isinstance(part["id"], str):
+                    raise ValueError("Anthropic tool_use block requires string 'id'")
+                if "name" not in part or not isinstance(part["name"], str):
+                    raise ValueError("Anthropic tool_use block requires string 'name'")
+                if "input" not in part or not isinstance(part["input"], dict):
+                    raise ValueError("Anthropic tool_use block requires dict 'input'")
+            elif b_type == "tool_result":
+                if "tool_use_id" not in part or not isinstance(part["tool_use_id"], str):
+                    raise ValueError("Anthropic tool_result block requires string 'tool_use_id'")
+            elif b_type == "thinking":
+                if "thinking" not in part or not isinstance(part["thinking"], str) or "signature" not in part or not isinstance(part["signature"], str):
+                    raise ValueError("Anthropic thinking block requires string 'thinking' and 'signature'")
+            elif b_type == "redacted_thinking":
+                if "data" not in part or not isinstance(part["data"], str):
+                    raise ValueError("Anthropic redacted_thinking block requires string 'data'")
+            else:
+                raise ValueError(f"Unsupported Anthropic content block type: '{b_type}'")
     else:
         raise ValueError(f"Anthropic message content must be string or list of blocks, got {type(content).__name__}")
 

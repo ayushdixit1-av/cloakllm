@@ -615,27 +615,38 @@ class SecretVault:
         return obj, 0
 
     def cloak_message_memoized(self, msg: dict) -> Tuple[dict, int]:
-        """Memoize cloaking per message with LRU bounding, version invalidation, and defensive copying (Findings F & K)."""
+        """Memoize cloaking per message with LRU bounding, optimistic concurrency version check, and defensive copying.
+
+        Protects against concurrent secret registration interleavings: if the vault version changes while
+        cloaking is in flight, the outdated result is discarded and cloaking is retried against the updated vault.
+        """
         canonical = json.dumps(msg, sort_keys=True, separators=(",", ":")).encode("utf-8")
         digest = hashlib.blake2b(canonical, digest_size=16).digest()
-        with self._lock:
-            cache_key = (self.session_key, self.vault_version, digest)
-            cached = self._message_memo.get(cache_key)
-            if cached is not None:
-                self._message_memo.move_to_end(cache_key)
-                cached_dict, count = cached
-                return copy.deepcopy(cached_dict), count
 
-        cloaked_msg, count = self.cloak_json_value(msg)
-        assert isinstance(cloaked_msg, dict)
+        while True:
+            with self._lock:
+                start_version = self.vault_version
+                cache_key = (self.session_key, start_version, digest)
+                cached = self._message_memo.get(cache_key)
+                if cached is not None:
+                    self._message_memo.move_to_end(cache_key)
+                    cached_dict, count = cached
+                    return copy.deepcopy(cached_dict), count
 
-        with self._lock:
-            cache_key = (self.session_key, self.vault_version, digest)
-            self._message_memo[cache_key] = (copy.deepcopy(cloaked_msg), count)
-            while len(self._message_memo) > MAX_MEMO_CACHE_SIZE:
-                self._message_memo.popitem(last=False)
+            # Cloak outside lock corresponding to start_version
+            cloaked_msg, count = self.cloak_json_value(msg)
+            assert isinstance(cloaked_msg, dict)
 
-        return cloaked_msg, count
+            with self._lock:
+                # Concurrent mutation check: if vault contents changed during cloaking, retry!
+                if self.vault_version != start_version:
+                    continue
+
+                self._message_memo[cache_key] = (copy.deepcopy(cloaked_msg), count)
+                while len(self._message_memo) > MAX_MEMO_CACHE_SIZE:
+                    self._message_memo.popitem(last=False)
+
+                return cloaked_msg, count
 
     def resolve_token(self, category: str, tag_hex: str) -> Optional[SecretEntry]:
         """Finding E: Exact-only token resolution: category AND tag MUST match the registered token."""

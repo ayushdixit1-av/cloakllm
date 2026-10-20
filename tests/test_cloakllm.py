@@ -1349,7 +1349,7 @@ def test_adversarial_slow_drip_body_deadline() -> None:
 
         elapsed = time.monotonic() - start_time
         # Invariant: Must cut off near deadline (<= 1.5s), NOT allowed to continue for 4.0s
-        assert elapsed < 2.0
+        assert elapsed <= 1.5
 
         # Read complete response until EOF
         s.settimeout(2.0)
@@ -1368,6 +1368,164 @@ def test_adversarial_slow_drip_body_deadline() -> None:
     finally:
         s.close()
         proxy.stop()
+
+
+def test_concurrent_memoization_version_interleaving() -> None:
+    """Finding 1 (Release Gate): Deterministic test for concurrent secret registration during in-flight cloaking.
+
+    Verifies that if a new secret is registered while a message is in flight:
+    1. The optimistic version check detects the version mismatch (start_version != vault_version).
+    2. The uncloaked secret is NEVER cached under the new vault version.
+    3. Cloaking automatically retries against the updated vault so all secrets are cloaked.
+    """
+    vault = SecretVault(session_key=b"concurrent-race-test-key-32b!")
+    sec1 = "sk-ant-api03-ExistingSecret12345"
+    vault.register_secret(sec1, category="ANTHROPIC")
+    v1 = vault.vault_version
+
+    sec2 = "postgresql://user:SecretDbPass999!@db.internal:5432/prod"
+    msg = {"role": "user", "content": f"Use {sec1} and {sec2}"}
+
+    original_cloak_json_value = vault.cloak_json_value
+    interleaving_triggered = False
+
+    def race_cloak_json_value(obj):
+        nonlocal interleaving_triggered
+        if not interleaving_triggered:
+            interleaving_triggered = True
+            # Concurrently register sec2 while Thread A was in-flight cloaking!
+            vault.register_secret(sec2, category="DB")
+            assert vault.vault_version == v1 + 1
+            # Return old view where sec2 was not yet registered/cloaked
+            return {"role": "user", "content": f"Use CLOAKv1_ANTHROPIC_TAG and {sec2}"}, 1
+        return original_cloak_json_value(obj)
+
+    vault.cloak_json_value = race_cloak_json_value
+
+    cloaked_res, count = vault.cloak_message_memoized(msg)
+
+    # Invariant 1: Interleaving occurred
+    assert interleaving_triggered is True
+
+    # Invariant 2: Because version changed from 1 to 2, the outdated result was discarded,
+    # cloaking was automatically retried against version 2, and sec2 MUST be cloaked!
+    assert sec1 not in json.dumps(cloaked_res)
+    assert sec2 not in json.dumps(cloaked_res)
+    assert count == 2
+
+    # Invariant 3: Cache entry under version 2 contains the fully cloaked message
+    cached_again, _ = vault.cloak_message_memoized(msg)
+    assert sec2 not in json.dumps(cached_again)
+
+
+def test_comprehensive_schema_validation_variants_and_rejections() -> None:
+    """Finding 2: Exhaustive validation of supported OpenAI & Anthropic message and content variant shapes."""
+    vault = SecretVault(session_key=b"exhaustive-schema-key-32-bytes!")
+
+    # 1. Valid Anthropic content blocks: image, tool_use, tool_result, thinking
+    anthropic_payload = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe image and run tool"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need to invoke tool",
+                        "signature": "sig_1234567890",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "bash",
+                        "input": {"command": "ls -la"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": "total 0",
+                    }
+                ],
+            },
+        ],
+    }
+    cloaked_ant, _ = cloak_request_payload(anthropic_payload, vault, canonical_route="/v1/messages")
+    assert len(cloaked_ant["messages"]) == 3
+
+    # 2. Reject malformed Anthropic variants fail-closed:
+    # Malformed image block (missing data)
+    with pytest.raises(ValueError, match="Anthropic image source requires"):
+        cloak_request_payload(
+            {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]},
+            vault,
+            canonical_route="/v1/messages",
+        )
+
+    # Malformed tool_use block (missing input dict)
+    with pytest.raises(ValueError, match="tool_use block requires dict 'input'"):
+        cloak_request_payload(
+            {"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": "not-a-dict"}]}]},
+            vault,
+            canonical_route="/v1/messages",
+        )
+
+    # Unsupported block type
+    with pytest.raises(ValueError, match="Unsupported Anthropic content block type"):
+        cloak_request_payload(
+            {"messages": [{"role": "user", "content": [{"type": "unsupported_video", "data": "video_bytes"}]}]},
+            vault,
+            canonical_route="/v1/messages",
+        )
+
+    # 3. Reject malformed OpenAI tool calls:
+    # Tool call missing function name
+    with pytest.raises(ValueError, match="tool_call function requires string 'name'"):
+        cloak_request_payload(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "c1", "type": "function", "function": {"arguments": "{}"}}],
+                    }
+                ]
+            },
+            vault,
+            canonical_route="/v1/chat/completions",
+        )
+
+    # Tool call with invalid type (not function)
+    with pytest.raises(ValueError, match="tool_call requires type 'function'"):
+        cloak_request_payload(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "c1", "type": "code_interpreter", "function": {"name": "run", "arguments": "{}"}}],
+                    }
+                ]
+            },
+            vault,
+            canonical_route="/v1/chat/completions",
+        )
 
 
 def test_unary_upstream_read_failure_handling(tmp_path: Path) -> None:
