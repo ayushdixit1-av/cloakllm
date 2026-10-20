@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+powershell.cmd
+powershell.bat
+*.jsonl
