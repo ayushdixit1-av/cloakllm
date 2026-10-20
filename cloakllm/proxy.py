@@ -66,6 +66,79 @@ class ProxyStats:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+OPENAI_ALLOWED_ROLES = {"system", "developer", "user", "assistant", "tool", "function"}
+ANTHROPIC_ALLOWED_ROLES = {"user", "assistant"}
+
+
+def validate_openai_message(m: dict) -> None:
+    """Validate OpenAI chat completion message schema variants strictly."""
+    if not isinstance(m, dict):
+        raise ValueError("OpenAI message must be a JSON object")
+    if "role" not in m or not isinstance(m.get("role"), str):
+        raise ValueError("OpenAI message must contain a string 'role'")
+    role = m["role"]
+    if role not in OPENAI_ALLOWED_ROLES:
+        raise ValueError(f"OpenAI message role '{role}' is not supported")
+
+    content = m.get("content")
+    if content is not None:
+        if isinstance(content, str):
+            pass
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or "type" not in part or not isinstance(part.get("type"), str):
+                    raise ValueError("OpenAI structured content part must be an object with string 'type'")
+                part_type = part["type"]
+                if part_type == "text" and "text" in part and not isinstance(part["text"], str):
+                    raise ValueError("OpenAI text content part must contain string 'text'")
+        else:
+            raise ValueError(f"OpenAI message content must be string, list of parts, or null, got {type(content).__name__}")
+    else:
+        # Null content allowed for assistant (e.g. tool_calls) or function
+        if role not in ("assistant", "function"):
+            raise ValueError(f"OpenAI message role '{role}' requires non-null content")
+
+    if "tool_calls" in m:
+        tc = m["tool_calls"]
+        if not isinstance(tc, list):
+            raise ValueError("OpenAI message 'tool_calls' must be a list")
+        for item in tc:
+            if not isinstance(item, dict) or "type" not in item:
+                raise ValueError("OpenAI tool_call must be an object with 'type'")
+            if "function" in item and not isinstance(item["function"], dict):
+                raise ValueError("OpenAI tool_call 'function' must be an object")
+
+    if "function_call" in m and not isinstance(m["function_call"], dict):
+        raise ValueError("OpenAI message 'function_call' must be an object")
+
+    if role == "tool" and ("tool_call_id" not in m or not isinstance(m["tool_call_id"], str)):
+        raise ValueError("OpenAI 'tool' message requires string 'tool_call_id'")
+
+    if role == "function" and ("name" not in m or not isinstance(m["name"], str)):
+        raise ValueError("OpenAI 'function' message requires string 'name'")
+
+
+def validate_anthropic_message(m: dict) -> None:
+    """Validate Anthropic messages schema variants strictly."""
+    if not isinstance(m, dict):
+        raise ValueError("Anthropic message must be a JSON object")
+    if "role" not in m or not isinstance(m.get("role"), str):
+        raise ValueError("Anthropic message must contain a string 'role'")
+    role = m["role"]
+    if role not in ANTHROPIC_ALLOWED_ROLES:
+        raise ValueError(f"Anthropic message role '{role}' is not supported")
+
+    content = m.get("content")
+    if isinstance(content, str):
+        pass
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict) or "type" not in part or not isinstance(part.get("type"), str):
+                raise ValueError("Anthropic content block must be an object with string 'type'")
+    else:
+        raise ValueError(f"Anthropic message content must be string or list of blocks, got {type(content).__name__}")
+
+
 def inject_system_hint(payload: dict, is_openai_format: bool = False) -> None:
     """Append a constant system-prompt hint without violating provider schema contracts."""
     if "messages" not in payload:
@@ -73,14 +146,14 @@ def inject_system_hint(payload: dict, is_openai_format: bool = False) -> None:
 
     if is_openai_format:
         # OpenAI schema: NEVER inject a top-level "system" property.
-        # Inject into system role message inside messages list.
+        # Inject into system/developer role message inside messages list.
         msgs = payload.get("messages")
         if not isinstance(msgs, list):
             raise ValueError("OpenAI route requires messages to be a list")
         for m in msgs:
             if not isinstance(m, dict) or "role" not in m or not isinstance(m.get("role"), str):
                 raise ValueError("OpenAI messages list must contain objects with string role")
-            if m.get("role") == "system":
+            if m.get("role") in ("system", "developer"):
                 content = m.get("content")
                 if isinstance(content, str):
                     if SYSTEM_PRESERVATION_HINT not in content:
@@ -175,35 +248,29 @@ def cloak_request_payload(
             out["system"] = cloaked_sys
             total_redacted += c
 
-    # 2. Messages handling with per-message memoization optimization
+    # 2. Messages handling with per-message memoization optimization and strict schema validation
     if "messages" in payload:
         raw_msgs = payload["messages"]
+        if not isinstance(raw_msgs, list):
+            raise ValueError("Messages property must be a list")
         if is_openai:
-            if not isinstance(raw_msgs, list):
-                raise ValueError("OpenAI route requires messages to be a list")
             for m in raw_msgs:
-                if not isinstance(m, dict) or "role" not in m or not isinstance(m.get("role"), str):
-                    raise ValueError("OpenAI messages must contain objects with string role")
-                if "content" in m and isinstance(m["content"], list):
-                    for part in m["content"]:
-                        if not isinstance(part, dict) or "type" not in part:
-                            raise ValueError("OpenAI structured content parts must be objects with type")
-        if isinstance(raw_msgs, list):
-            new_msgs = []
-            for msg in raw_msgs:
-                if isinstance(msg, dict):
-                    c_msg, c = vault.cloak_message_memoized(msg)
-                    new_msgs.append(c_msg)
-                    total_redacted += c
-                else:
-                    c_msg, c = vault.cloak_json_value(msg)
-                    new_msgs.append(c_msg)
-                    total_redacted += c
-            out["messages"] = new_msgs
-        else:
-            cloaked_m, c = vault.cloak_json_value(raw_msgs)
-            out["messages"] = cloaked_m
-            total_redacted += c
+                validate_openai_message(m)
+        elif canonical_route.startswith("/v1/messages"):
+            for m in raw_msgs:
+                validate_anthropic_message(m)
+
+        new_msgs = []
+        for msg in raw_msgs:
+            if isinstance(msg, dict):
+                c_msg, c = vault.cloak_message_memoized(msg)
+                new_msgs.append(c_msg)
+                total_redacted += c
+            else:
+                c_msg, c = vault.cloak_json_value(msg)
+                new_msgs.append(c_msg)
+                total_redacted += c
+        out["messages"] = new_msgs
 
     # 3. Schema-aware system preservation hint injection
     inject_system_hint(out, is_openai_format=is_openai)
@@ -579,6 +646,7 @@ class CloakProxyServer:
         url_token: Optional[str] = None,
         event_logger: Optional[EventLogger] = None,
         port: int = 0,
+        body_read_timeout_seconds: float = 30.0,
     ) -> None:
         self.vault = vault
         self.upstream_base_url = upstream_base_url.rstrip("/")
@@ -586,6 +654,7 @@ class CloakProxyServer:
         self.url_token = url_token or secrets.token_urlsafe(18)
         self.logger = event_logger or EventLogger()
         self.stats = ProxyStats()
+        self.body_read_timeout_seconds = body_read_timeout_seconds
         self._server: Optional[BoundedThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._requested_port = port
@@ -899,7 +968,7 @@ class CloakProxyServer:
         if content_len > 0:
             read_chunks = []
             bytes_read = 0
-            body_read_deadline = time.monotonic() + 30.0  # Hard 30s total request deadline
+            body_read_deadline = time.monotonic() + self.body_read_timeout_seconds  # Enforce configured total request deadline
             original_timeout = handler.timeout
             try:
                 while bytes_read < content_len:
@@ -923,7 +992,7 @@ class CloakProxyServer:
                         return
 
                     # Dynamically clamp socket timeout so the blocking read cannot exceed total deadline!
-                    chunk_timeout = min(15.0, remaining_deadline)
+                    chunk_timeout = max(0.001, min(15.0, remaining_deadline))
                     if handler.connection is not None:
                         try:
                             handler.connection.settimeout(chunk_timeout)
@@ -1121,7 +1190,7 @@ class CloakProxyServer:
         if outbound_body:
             forward_headers["Content-Length"] = str(len(outbound_body))
 
-        conn: http.client.HTTPConnection
+        conn: Optional[http.client.HTTPConnection] = None
         try:
             if use_https:
                 ctx = ssl.create_default_context()
@@ -1132,6 +1201,11 @@ class CloakProxyServer:
             conn.request(method, target_path, body=outbound_body, headers=forward_headers)
             resp = conn.getresponse()
         except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self.logger.log("upstream_error", status=502)
             self._send_json_error(handler, 502, "ERR_UPSTREAM_CONNECTION_FAILED", "Failed to connect to upstream service.")
             return
@@ -1218,7 +1292,18 @@ class CloakProxyServer:
                 resp_chunks = []
                 total_read = 0
                 while True:
-                    chunk = resp.read(65536)
+                    try:
+                        chunk = resp.read(65536)
+                    except Exception:
+                        self.logger.log("upstream_read_error", status=502)
+                        self._send_json_error(
+                            handler,
+                            502,
+                            "ERR_UPSTREAM_READ_FAILED",
+                            "Failed to read response from upstream service.",
+                        )
+                        return
+
                     if not chunk:
                         break
                     total_read += len(chunk)
@@ -1232,6 +1317,24 @@ class CloakProxyServer:
                         )
                         return
                     resp_chunks.append(chunk)
+
+                # Check for truncated response against declared Content-Length
+                cl_header = resp.getheader("Content-Length")
+                if cl_header is not None:
+                    try:
+                        expected_len = int(cl_header.strip())
+                        if total_read != expected_len:
+                            self.logger.log("upstream_read_error", status=502, expected=expected_len, actual=total_read)
+                            self._send_json_error(
+                                handler,
+                                502,
+                                "ERR_UPSTREAM_READ_FAILED",
+                                "Upstream disconnected before sending declared Content-Length.",
+                            )
+                            return
+                    except ValueError:
+                        pass
+
                 raw_resp_body = b"".join(resp_chunks)
 
                 # Finding 7: Fail closed on response rehydration failure!
@@ -1266,4 +1369,8 @@ class CloakProxyServer:
                     handler.wfile.write(raw_resp_body)
                     handler.wfile.flush()
         finally:
-            conn.close()
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass

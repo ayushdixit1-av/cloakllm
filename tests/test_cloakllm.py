@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import select
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
+import time
 from urllib.parse import urlsplit
 
 import pytest
@@ -1302,4 +1304,192 @@ def test_json_key_rehydration() -> None:
     assert sec in rehydrated_obj
     assert token not in rehydrated_obj
     assert rehydrated_obj[sec] == "value_for_secret"
+
+
+def test_adversarial_slow_drip_body_deadline() -> None:
+    """Finding 2: Adversarial slow-drip test verifying hard wall-clock cutoff (HTTP 408)."""
+    vault = SecretVault(session_key=b"slow-drip-test-key-32-bytes!!!!")
+    # Configure tight 0.5s body read deadline
+    proxy = CloakProxyServer(
+        vault=vault,
+        upstream_base_url="http://127.0.0.1:9",
+        body_read_timeout_seconds=0.5,
+    )
+    base_url = proxy.start()
+    sp = urlsplit(base_url)
+
+    s = socket.create_connection((sp.hostname, sp.port), timeout=10.0)
+    try:
+        # Declare 5000 bytes Content-Length
+        req_headers = (
+            f"POST /{proxy.url_token}/v1/messages HTTP/1.1\r\n"
+            f"Host: {sp.hostname}:{sp.port}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 5000\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        s.sendall(req_headers.encode("utf-8"))
+
+        start_time = time.monotonic()
+        resp_data = b""
+        # Drip 1 byte every 0.08 seconds (50 drips would take 4.0 seconds if allowed)
+        for _ in range(50):
+            try:
+                s.sendall(b"x")
+            except (socket.error, OSError):
+                break
+
+            # Check if server responded with 408 or closed
+            r, _, _ = select.select([s], [], [], 0.08)
+            if r:
+                try:
+                    chunk = s.recv(4096)
+                    if chunk:
+                        resp_data += chunk
+                        break
+                except (socket.error, OSError):
+                    break
+
+            if time.monotonic() - start_time > 2.0:
+                break
+
+        elapsed = time.monotonic() - start_time
+        # Invariant: Must cut off near deadline (<= 1.5s), NOT allowed to continue for 4.0s
+        assert elapsed < 2.0
+
+        # Read any remaining response bytes
+        if not resp_data:
+            s.settimeout(1.0)
+            while True:
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    resp_data += chunk
+                except (socket.timeout, OSError):
+                    break
+
+        # Must return 408 Request Timeout with standard JSON error envelope
+        assert b"408" in resp_data
+        assert b"ERR_REQUEST_TIMEOUT" in resp_data
+    finally:
+        s.close()
+        proxy.stop()
+
+
+def test_unary_upstream_read_failure_handling(tmp_path: Path) -> None:
+    """Finding 1: Verify non-streaming upstream read failure is caught and returns 502 ERR_UPSTREAM_READ_FAILED."""
+    class TruncatedUpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            # Declare 1000 bytes Content-Length but send only 10 bytes and abruptly close
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'{"part": 1')
+            self.wfile.flush()
+            # Abruptly close socket without sending remaining bytes
+            self.close_connection = True
+
+        def log_message(self, *args) -> None:
+            return
+
+    up_server = ThreadingHTTPServer(("127.0.0.1", 0), TruncatedUpstreamHandler)
+    up_thread = threading.Thread(target=up_server.serve_forever, daemon=True)
+    up_thread.start()
+    up_url = f"http://127.0.0.1:{up_server.server_port}"
+
+    vault = SecretVault(session_key=b"unary-read-fail-key-32-bytes!")
+    logger = EventLogger(log_path=tmp_path / "events.jsonl")
+    proxy = CloakProxyServer(
+        vault=vault,
+        upstream_base_url=up_url,
+        event_logger=logger,
+    )
+    base_url = proxy.start()
+    sp = urlsplit(base_url)
+
+    try:
+        conn = http.client.HTTPConnection(sp.hostname, sp.port, timeout=10.0)
+        body = json.dumps({"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+        conn.request(
+            "POST",
+            f"/{proxy.url_token}/v1/messages",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+
+        # Invariant: Must fail closed with 502 ERR_UPSTREAM_READ_FAILED
+        assert resp.status == 502
+        err_data = json.loads(resp_body.decode("utf-8"))
+        assert err_data["error"]["code"] == "ERR_UPSTREAM_READ_FAILED"
+    finally:
+        proxy.stop()
+        up_server.shutdown()
+
+
+def test_openai_and_anthropic_message_schema_variants_and_cloaking() -> None:
+    """Finding 3: Test complete OpenAI & Anthropic message schema variants, tool_calls cloaking, and malformed rejection."""
+    vault = SecretVault(session_key=b"schema-variants-key-32-bytes!!")
+    sec_key = "sk-ant-api03-SchemaSecretTestKey12345"
+    vault.register_secret(sec_key, category="ANTHROPIC")
+
+    # 1. Valid OpenAI variants: developer role, assistant with tool_calls and null content, tool role with tool_call_id
+    openai_payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "developer", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Use key {sec_key}"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "query_db",
+                            "arguments": json.dumps({"token": sec_key}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": f"Result with {sec_key}"},
+        ],
+    }
+    cloaked, count = cloak_request_payload(openai_payload, vault, canonical_route="/v1/chat/completions")
+    # Invariant: secret must be cloaked across user content, tool call arguments, and tool response
+    assert sec_key not in json.dumps(cloaked)
+    assert count >= 3
+    # Developer message must have preservation hint injected
+    dev_msg = cloaked["messages"][0]
+    assert dev_msg["role"] == "developer"
+    assert "CLOAKv1" in dev_msg["content"]
+
+    # Assistant message content must remain None (not coerced to string or lost)
+    asst_msg = cloaked["messages"][2]
+    assert asst_msg["content"] is None
+    assert "CLOAKv1_ANTHROPIC_" in asst_msg["tool_calls"][0]["function"]["arguments"]
+
+    # 2. Reject malformed structures without coercing
+    # Unsupported role
+    with pytest.raises(ValueError, match="not supported"):
+        cloak_request_payload({"messages": [{"role": "admin", "content": "hello"}]}, vault, canonical_route="/v1/chat/completions")
+
+    # Missing tool_call_id on tool role
+    with pytest.raises(ValueError, match="requires string 'tool_call_id'"):
+        cloak_request_payload({"messages": [{"role": "tool", "content": "result"}]}, vault, canonical_route="/v1/chat/completions")
+
+    # Malformed tool_calls (not a list)
+    with pytest.raises(ValueError, match="must be a list"):
+        cloak_request_payload({"messages": [{"role": "assistant", "tool_calls": "not-a-list"}]}, vault, canonical_route="/v1/chat/completions")
+
+    # Non-object structured content part
+    with pytest.raises(ValueError, match="must be an object"):
+        cloak_request_payload({"messages": [{"role": "user", "content": [123]}]}, vault, canonical_route="/v1/chat/completions")
+
 
