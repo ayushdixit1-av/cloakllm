@@ -245,6 +245,8 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
     """Add secret-file Read(...) deny rules to .claude/settings.json (or ~/.claude/settings.json).
 
     Preserves existing keys and allow-lists `.env.example` / `.env.sample` / `.env.template`.
+    Safely rejects symlinks in settings_path and its parent directories.
+    Performs atomic replacement with 0600 permissions.
     Returns `(settings_file_path, newly_added_rules)`.
     """
     if use_global:
@@ -253,9 +255,25 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
         base = target_dir or Path.cwd()
         settings_path = base / ".claude" / "settings.json"
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    parent_dir = settings_path.parent
+
+    # 1. Symlink defense for parent directory
+    if parent_dir.is_symlink():
+        raise ValueError(f"Refusing to harden settings: parent directory '{parent_dir}' is a symlink")
+
+    parent_dir.mkdir(parents=True, exist_ok=True)
+
+    if parent_dir.is_symlink():
+        raise ValueError(f"Refusing to harden settings: parent directory '{parent_dir}' is a symlink")
+
+    # 2. Symlink defense for settings.json itself
+    if settings_path.is_symlink():
+        raise ValueError(f"Refusing to harden settings: '{settings_path}' is a symlink")
+
     data: dict = {}
-    if settings_path.is_file():
+    if settings_path.exists():
+        if not settings_path.is_file() or settings_path.is_symlink():
+            raise ValueError(f"Refusing to harden settings: '{settings_path}' is not a regular file")
         try:
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
@@ -279,5 +297,28 @@ def harden_claude_settings(target_dir: Optional[Path] = None, use_global: bool =
             deny_list.append(rule)
             added.append(rule)
 
-    settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    # 3. Safe atomic write with 0600 permissions and zero .bak retention
+    content = json.dumps(data, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(parent_dir), prefix=".cloakllm_harden_", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as tmp_fh:
+            tmp_fh.write(content)
+            tmp_fh.flush()
+            os.fsync(tmp_fh.fileno())
+        # Re-check settings_path is not a symlink before replacing
+        if settings_path.is_symlink():
+            raise ValueError(f"Refusing to harden settings: target '{settings_path}' became a symlink")
+        os.replace(str(tmp_path), str(settings_path))
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
     return settings_path, added

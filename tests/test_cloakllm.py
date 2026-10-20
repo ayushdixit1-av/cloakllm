@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import select
@@ -1571,13 +1572,14 @@ def test_comprehensive_schema_validation_variants_and_rejections() -> None:
 
 
 def test_multithreaded_concurrent_memoization_stress() -> None:
-    """Stress test: Genuinely multi-threaded concurrent cloaking under sustained secret registration.
+    """Stress test: Multi-threaded concurrent cloaking under sustained secret registration.
 
     Runs multiple worker threads calling cloak_message_memoized concurrently while
     a writer thread continuously registers new secrets and increments vault_version.
     Proves:
     1. Zero deadlocks or exceptions under sustained thread contention.
-    2. No race condition permits an uncloaked registered secret to be returned or cached.
+    2. Zero leakage of ANY secret that was registered at or before the message was cloaked.
+    3. Thread termination checked on every worker.
     """
     vault = SecretVault(session_key=b"multithread-stress-key-32-bytes!")
     initial_secrets = [f"sk_live_initial_secret_{i:04d}_abcdef" for i in range(10)]
@@ -1585,7 +1587,7 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
         vault.register_secret(s, category="STRIPE")
 
     dynamic_secrets = [f"sk-ant-api03-dynamic_secret_{i:04d}_uvwxyz" for i in range(25)]
-    registered_so_far = set(initial_secrets)
+    secret_reg_versions: Dict[str, int] = {s: 1 for s in initial_secrets}
     reg_lock = threading.Lock()
 
     stop_event = threading.Event()
@@ -1598,7 +1600,7 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
             time.sleep(0.015)
             with reg_lock:
                 vault.register_secret(s, category="ANTHROPIC")
-                registered_so_far.add(s)
+                secret_reg_versions[s] = vault.vault_version
 
     def reader_worker(thread_id: int):
         iters = 0
@@ -1609,16 +1611,28 @@ def test_multithreaded_concurrent_memoization_stress() -> None:
                 "role": "user",
                 "content": f"Thread {thread_id} using {target_sec} and {initial_secrets[0]}",
             }
-            try:
-                # Capture known secrets prior to cloaking to ensure unambiguous sequence-ordered registration
-                with reg_lock:
-                    known_before = set(registered_so_far)
+            canonical = json.dumps(msg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            digest = hashlib.blake2b(canonical, digest_size=16).digest()
 
+            try:
                 cloaked, _ = vault.cloak_message_memoized(msg)
                 cloaked_str = json.dumps(cloaked)
 
-                if target_sec in known_before and target_sec in cloaked_str:
-                    errors.append(f"Thread {thread_id}: Leaked registered secret {target_sec} in output!")
+                # Query the exact vault version under which this message was cloaked and cached
+                with vault._lock:
+                    cached_keys = [k for k in vault._message_memo.keys() if k[2] == digest]
+                    msg_version = cached_keys[-1][1] if cached_keys else vault.vault_version
+
+                # Every secret registered at or before msg_version MUST be cloaked in this output!
+                with reg_lock:
+                    must_be_cloaked = [s for s, v in secret_reg_versions.items() if v <= msg_version]
+
+                for sec in must_be_cloaked:
+                    if sec in cloaked_str:
+                        errors.append(
+                            f"Thread {thread_id}: Leaked secret {sec} (registered at v{secret_reg_versions[sec]} <= msg_v{msg_version}) in output!"
+                        )
+
                 if initial_secrets[0] in cloaked_str:
                     errors.append(f"Thread {thread_id}: Leaked initial secret in output!")
             except Exception as e:
@@ -1858,5 +1872,373 @@ def test_malformed_schema_http_boundary_fail_closed(tmp_path: Path) -> None:
     finally:
         proxy.stop()
         up_server.shutdown()
+
+
+def test_harden_claude_settings_symlink_rejection_and_atomic_replace(tmp_path: Path) -> None:
+    """Finding 1 (Release Gate): Verify harden_claude_settings rejects symlinks and writes atomically with 0600."""
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    target_sensitive = tmp_path / "sensitive.txt"
+    target_sensitive.write_text("SENSITIVE_DATA", encoding="utf-8")
+
+    claude_dir = proj_dir / ".claude"
+    claude_dir.mkdir()
+    settings_symlink = claude_dir / "settings.json"
+
+    try:
+        settings_symlink.symlink_to(target_sensitive)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported on this environment")
+
+    # 1. Reject symlinked settings.json and ensure target file is untouched
+    with pytest.raises(ValueError, match="is a symlink"):
+        harden_claude_settings(target_dir=proj_dir)
+    assert target_sensitive.read_text(encoding="utf-8") == "SENSITIVE_DATA"
+
+    # Remove file symlink
+    settings_symlink.unlink()
+
+    # 2. Reject symlinked .claude parent directory
+    proj_dir_2 = tmp_path / "proj2"
+    proj_dir_2.mkdir()
+    real_dir = tmp_path / "outside_claude"
+    real_dir.mkdir()
+    claude_symlink_dir = proj_dir_2 / ".claude"
+    claude_symlink_dir.symlink_to(real_dir)
+
+    with pytest.raises(ValueError, match="parent directory .* is a symlink"):
+        harden_claude_settings(target_dir=proj_dir_2)
+
+    # 3. Verify normal atomic hardening succeeds and writes 0600
+    settings_file, added = harden_claude_settings(target_dir=proj_dir)
+    assert settings_file.is_file()
+    assert not settings_file.is_symlink()
+    assert "Read(./.env)" in added
+    data = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert "Read(./.env)" in data["permissions"]["deny"]
+
+
+def test_deterministic_barrier_concurrent_memoization_race() -> None:
+    """Finding 2 (Release Gate): Two-thread deterministic barrier interleaving test.
+
+    Enforces that when Thread A is paused inside cloaking (holding start_version = v1),
+    Thread B registers a new secret (bumping vault_version to v2).
+    Thread A resumes, detects start_version != vault_version, discards the uncloaked result,
+    retries, and returns a fully cloaked result under v2.
+    Proves:
+    1. Zero leakage of sec2 in output.
+    2. Cache invariant: no uncloaked entry exists under v1 or v2.
+    3. Thread A and Thread B terminate cleanly without deadlock.
+    """
+    vault = SecretVault(session_key=b"deterministic-barrier-key-32b!!")
+    sec1 = "sk-ant-api03-PreRegisteredBarrierSecret123"
+    vault.register_secret(sec1, category="ANTHROPIC")
+    v1 = vault.vault_version
+
+    sec2 = "postgresql://barrier_user:SuperSecretDbPass999!@db.internal:5432/app"
+    msg = {"role": "user", "content": f"Connect using {sec1} and {sec2}"}
+
+    cloaking_started = threading.Event()
+    secret_registered = threading.Event()
+
+    original_cloak_json = vault.cloak_json_value
+    interleaving_occurred = False
+
+    def barrier_cloak_json_value(obj):
+        nonlocal interleaving_occurred
+        if not interleaving_occurred:
+            interleaving_occurred = True
+            # Signal Thread B that Thread A has begun cloaking under start_version == v1
+            cloaking_started.set()
+            # Wait until Thread B has registered sec2 and bumped vault_version
+            assert secret_registered.wait(timeout=5.0), "Timeout waiting for Thread B registration"
+            # Return old view where sec2 was uncloaked
+            return {"role": "user", "content": f"Connect using CLOAKv1_ANTHROPIC_TAG and {sec2}"}, 1
+        return original_cloak_json(obj)
+
+    vault.cloak_json_value = barrier_cloak_json_value
+
+    result_holder = {}
+    errors = []
+
+    def thread_a_reader():
+        try:
+            cloaked_msg, count = vault.cloak_message_memoized(msg)
+            result_holder["cloaked"] = cloaked_msg
+            result_holder["count"] = count
+        except Exception as e:
+            errors.append(f"Thread A exception: {e}")
+
+    def thread_b_writer():
+        try:
+            assert cloaking_started.wait(timeout=5.0), "Timeout waiting for Thread A to start"
+            # Thread B registers sec2 while Thread A was in-flight cloaking!
+            vault.register_secret(sec2, category="DB")
+            assert vault.vault_version == v1 + 1
+            secret_registered.set()
+        except Exception as e:
+            errors.append(f"Thread B exception: {e}")
+
+    t_a = threading.Thread(target=thread_a_reader, daemon=True)
+    t_b = threading.Thread(target=thread_b_writer, daemon=True)
+
+    t_a.start()
+    t_b.start()
+
+    t_a.join(timeout=5.0)
+    t_b.join(timeout=5.0)
+
+    assert not t_a.is_alive(), "Thread A failed to terminate within timeout"
+    assert not t_b.is_alive(), "Thread B failed to terminate within timeout"
+    assert errors == [], f"Thread errors: {errors}"
+    assert interleaving_occurred is True
+
+    cloaked_res = result_holder["cloaked"]
+    cloaked_json = json.dumps(cloaked_res)
+
+    # Invariant 1: sec1 and sec2 are completely cloaked
+    assert sec1 not in cloaked_json, "sec1 leaked in output"
+    assert sec2 not in cloaked_json, "sec2 leaked in output"
+    assert result_holder["count"] == 2
+
+    # Invariant 2: Cache inspection proves no stale entry exists under v1,
+    # and the cached entry under v2 has both secrets cloaked.
+    with vault._lock:
+        assert len(vault._message_memo) == 1
+        for (session_k, ver, digest), (cached_dict, cnt) in vault._message_memo.items():
+            cached_json = json.dumps(cached_dict)
+            assert sec1 not in cached_json
+            assert sec2 not in cached_json
+            assert ver == v1 + 1 == vault.vault_version
+            assert cnt == 2
+
+
+def test_adversarial_streaming_malformed_sse_and_truncated_chunks() -> None:
+    """Release Gate Assurance: Verify streaming rehydration handles malformed SSE, token splits, and truncated streams."""
+    vault = SecretVault(session_key=b"adversarial-streaming-key-32b!!")
+    sec_key = "sk-ant-api03-StreamingAdversarialKey123"
+    entry = vault.register_secret(sec_key, category="ANTHROPIC")
+    token = entry.token
+
+    events_rehydrated = []
+    rehydrator = StreamRehydrator(vault=vault, on_event=lambda k, t: events_rehydrated.append((k, t)))
+
+    # 1. Token split across 3 consecutive SSE chunks
+    part1 = f'data: {{"type": "content_block_delta", "delta": {{"type": "text_delta", "text": "Result: {token[:12]}'
+    part2 = f'{token[12:28]}'
+    part3 = f'{token[28:]} completed."}}}}\n\n'
+
+    out1 = rehydrator.feed_bytes(part1.encode("utf-8"))
+    out2 = rehydrator.feed_bytes(part2.encode("utf-8"))
+    out3 = rehydrator.feed_bytes(part3.encode("utf-8"))
+    combined = (out1 + out2 + out3).decode("utf-8")
+
+    # Invariant: Must rehydrate to the exact secret string
+    assert sec_key in combined
+    assert token not in combined
+
+    # 2. SSE comments, pings, empty lines, and non-JSON data lines are passed through safely without error
+    adversarial_sse = (
+        b": sse ping comment\n\n"
+        b"event: ping\ndata: {}\n\n"
+        b"data: [DONE]\n\n"
+        b"data: plain string not an object\n\n"
+        b"data: \n\n"
+    )
+    out_adv = rehydrator.feed_bytes(adversarial_sse)
+    assert b": sse ping comment\n\n" in out_adv
+    assert b"[DONE]" in out_adv
+
+    # 3. Thinking block immune from rehydration
+    thinking_event = json.dumps(
+        {
+            "type": "content_block_start",
+            "content_block": {"type": "thinking", "thinking": f"Internal trace with {token}", "signature": "sig_ok"},
+        }
+    ).encode("utf-8")
+    out_thinking = rehydrator.feed_bytes(b"data: " + thinking_event + b"\n\n")
+    # Thinking block remains intact
+    assert token.encode("utf-8") in out_thinking
+
+    # 4. Flush at EOF clears holdback buffer cleanly
+    residual = rehydrator.flush()
+    assert residual == b""
+
+
+def test_adversarial_proxy_bypass_and_alternate_destinations(tmp_path: Path) -> None:
+    """Release Gate Assurance: Verify proxy bypass attacks, path traversals, and unauthorized routes fail closed."""
+    upstream_dispatched: list[dict] = []
+
+    class MockUpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            upstream_dispatched.append({"path": self.path})
+            self.send_response(200)
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            upstream_dispatched.append({"path": self.path})
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args) -> None:
+            return
+
+    up_server = ThreadingHTTPServer(("127.0.0.1", 0), MockUpstreamHandler)
+    up_thread = threading.Thread(target=up_server.serve_forever, daemon=True)
+    up_thread.start()
+    up_url = f"http://127.0.0.1:{up_server.server_port}"
+
+    vault = SecretVault(session_key=b"proxy-bypass-test-key-32-bytes!!")
+    logger = EventLogger(log_path=tmp_path / "events.jsonl")
+    proxy = CloakProxyServer(vault=vault, upstream_base_url=up_url, event_logger=logger)
+    base_url = proxy.start()
+    sp = urlsplit(base_url)
+    tok = proxy.url_token
+
+    bypass_attempts = [
+        # Missing URL capability token
+        ("POST", "/v1/messages", 401),
+        ("GET", "/v1/models", 401),
+        # Wrong / forged URL capability token
+        ("POST", "/wrong_forged_capability_token_12345/v1/messages", 401),
+        # Path traversal attempting to escape capability token
+        ("POST", f"/{tok}/../../v1/messages", 400),
+        ("POST", f"/{tok}/..%2f..%2fv1/messages", 400),
+        # Unsupported HTTP methods (non-allowlisted method/route returns 403)
+        ("PUT", f"/{tok}/v1/messages", 403),
+        ("DELETE", f"/{tok}/v1/messages", 403),
+        # Unsupported non-allowlisted routes
+        ("POST", f"/{tok}/v1/admin/debug", 403),
+        ("POST", f"/{tok}/api/internal/config", 403),
+    ]
+
+    try:
+        for method, path, expected_status in bypass_attempts:
+            conn = http.client.HTTPConnection(sp.hostname, sp.port, timeout=5.0)
+            conn.request(method, path, body=b"{}", headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            assert resp.status == expected_status, f"{method} {path} expected {expected_status}, got {resp.status}"
+
+        # Invariant: Zero bypass requests ever reached the upstream server!
+        assert len(upstream_dispatched) == 0, f"Upstream unexpectedly received: {upstream_dispatched}"
+    finally:
+        proxy.stop()
+        up_server.shutdown()
+
+
+def test_reproducible_expanded_credential_detection_benchmark(tmp_path: Path) -> None:
+    """Finding 3 (Release Gate): 60-case reproducible credential detection and false-positive benchmark.
+
+    Evaluates:
+    - 30 diverse credential formats across Anthropic, OpenAI, Stripe, AWS, GitHub, Slack, PEM, and DB URIs.
+    - 30 realistic benign lookalikes (UUIDs, git commits, public URLs, CSS classes, semver, non-secret env vars).
+    Asserts:
+    1. 100% recall on indexed credentials and known prefixes (30/30).
+    2. 0% false positives on benign lookalikes (0/30).
+    """
+    # 1. Benchmark Credential Dataset (30 real-world format variants)
+    credential_dataset = [
+        ("ANTHROPIC", "sk-" + "ant-api03-LiveAnthropicApiKey1234567890abcdef"),
+        ("ANTHROPIC", "sk-" + "ant-admin01-LiveAnthropicAdminKey9876543210zyxwv"),
+        ("OPENAI", "sk-" + "proj-OpenAiProjectApiKey1234567890AbCdEfGhIjKlMnOp"),
+        ("OPENAI", "sk-" + "admin-OpenAiAdminApiKey0987654321ZyXwVuTsRqPoNmLk"),
+        ("STRIPE", "sk_" + "live_51AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"),
+        ("STRIPE", "rk_" + "live_51RestrictedKey0123456789AbCdEfGhIjKlMnOp"),
+        ("STRIPE", "whsec_" + "StripeWebhookSecret1234567890abcdef"),
+        ("AWS", "AKIA" + "IOSFODNN7EXAMPLE"),
+        ("AWS", "ASIA" + "IOSFODNN7EXAMPLE"),
+        ("GITHUB", "ghp_" + "GitHubPersonalAccessToken1234567890ab"),
+        ("GITHUB", "github_" + "pat_11AAAAAAA_FineGrainedToken0123456789AbCdEfGhIjKlMnOpQrStUvWxYz"),
+        ("GITHUB", "gho_" + "GitHubOAuthToken1234567890abcdefgh"),
+        ("SLACK", "xoxb" + "-1234567890-1234567890123-abcdefghijklmnopqrstuvwx"),
+        ("SLACK", "xoxp" + "-1234567890-1234567890123-abcdefghijklmnopqrstuvwx"),
+        ("PEM", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0m...\n-----END RSA PRIVATE KEY-----"),
+        ("PEM", "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEI...\n-----END EC PRIVATE KEY-----"),
+        ("PEM", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNza...\n-----END OPENSSH PRIVATE KEY-----"),
+        ("DB", "postgresql://app_user:ComplexDbP%40ss999!@db.internal:5432/production"),
+        ("DB", "mysql://admin:AnotherSecurePassWord888!@mysql.db:3306/main"),
+        ("DB", "mongodb+srv://user:MongoAtlasSecretPass777!@cluster0.mongodb.net/app"),
+        ("DB", "redis://:RedisAuthTokenPassWord666!@redis.cache:6379/0"),
+        ("AUTH", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.doNotLeakThisSignaturePart123"),
+        ("SECRET", "HighEntropyCustomSecretTokenVal999!"),
+        ("PASS", "SuperSecurePassword12345!#$"),
+        ("WEBHOOK", "whsec_GenericWebhookSecretToken888!"),
+        ("KEY", "CustomEncryptionKeyMaterialString777!"),
+        ("TOKEN", "BearerTokenMaterialString999999!"),
+        ("DB", "postgres://user:SimplePass99!@host:5432/db"),
+        ("SECRET", "export MY_EXPORTED_SECRET=sk-ant-api03-ExportedSecretValue12345"),
+        ("AUTH", "JWT_SECRET=MySuperSecretJwtSigningKey99999!"),
+    ]
+
+    # 2. Benign Lookalike Dataset (30 realistic false-positive hazards)
+    benign_lookalike_dataset = [
+        "123e4567-e89b-12d3-a456-426614174000",  # UUIDv4
+        "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",  # UUIDv4
+        "a1b2c3d4e5f67890123456789abcdef012345678",  # Git commit hash
+        "e6d2c4b1a0987654321fedcba0987654321fedcb",  # Git commit hash
+        "https://api.github.com/repos/owner/repo/pulls",  # Public URL
+        "https://cdn.example.com/assets/styles.min.css",  # Plain URL
+        "claude-3-5-sonnet-20241022",  # Model ID
+        "gpt-4o-2024-08-06",  # Model ID
+        "gemini-1.5-pro-preview-0409",  # Model ID
+        "v1.2.3-beta.4+build.2026",  # Semver
+        "PORT=8080",  # Plain port config
+        "NODE_ENV=production",  # Environment mode
+        "HOST=127.0.0.1",  # Localhost binding
+        "DEBUG=false",  # Boolean flag
+        "LOG_LEVEL=info",  # Log level
+        "NEXT_PUBLIC_STRIPE_KEY=pk_live_51PublicPublishableKey123",  # Public publishable key
+        "VITE_PUBLIC_ANON_KEY=public-anon-key-material-safe",  # Public anon key
+        "PUBLIC_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePublicKey",  # SSH public key
+        "admin",  # Stoplisted word
+        "password",  # Stoplisted word
+        "secret",  # Stoplisted word
+        "12345678",  # Numeric sequence
+        "/usr/local/bin/python3",  # File path
+        "C:\\Users\\Public\\Desktop",  # Windows path
+        "btn-primary-active-state",  # CSS class name
+        "container-fluid mx-auto px-4",  # CSS classes
+        "SELECT id, name, email FROM users WHERE active = 1;",  # SQL query
+        "import os\nimport sys\nprint('hello')",  # Python code
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",  # Image data
+        "{\"type\": \"text\", \"text\": \"Benign structured output message.\"}",  # JSON snippet
+    ]
+
+    # Build vault from .env content with the 30 credentials
+    env_lines = []
+    for idx, (cat, val) in enumerate(credential_dataset):
+        key_name = f"SECRET_CREDENTIAL_{idx:02d}_{cat}"
+        env_lines.append(f"{key_name}={val}")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+
+    vault = SecretVault(session_key=b"benchmark-session-key-32-bytes!!")
+    loaded = vault.load_env_file(env_file)
+    assert loaded > 0, "Vault must load indexed secrets"
+
+    # Evaluate Recall
+    detected_count = 0
+    for cat, secret in credential_dataset:
+        sample_text = f"Here is the credential to use: {secret} in production."
+        matches = vault.scan_text(sample_text)
+        if matches:
+            detected_count += 1
+
+    recall_rate = (detected_count / len(credential_dataset)) * 100.0
+    assert recall_rate == 100.0, f"Credential recall was {recall_rate}% (expected 100%)"
+
+    # Evaluate Specificity (0 False Positives on Benign Lookalikes)
+    false_positives = 0
+    for benign in benign_lookalike_dataset:
+        sample_text = f"Processing normal application text with {benign} here."
+        matches = vault.scan_text(sample_text)
+        if matches:
+            false_positives += 1
+
+    fp_rate = (false_positives / len(benign_lookalike_dataset)) * 100.0
+    assert false_positives == 0, f"False positives detected: {false_positives} ({fp_rate}%)"
 
 

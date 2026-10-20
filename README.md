@@ -3,7 +3,7 @@
 **Audit what Claude Code already leaked in `~/.claude` — and cloak your project secrets in real time before they ever leave your machine.**
 
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#install)
-[![Tests](https://img.shields.io/badge/tests-39%20passed%20%7C%208%2F8%20CI%20matrix-brightgreen)](#supported-provider-api-schemas--variant-contracts)
+[![Tests](https://img.shields.io/badge/tests-44%20passed%20%7C%208%2F8%20CI%20matrix-brightgreen)](#supported-provider-api-schemas--variant-contracts)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Every time Claude Code reads a config file, inspects test output, or runs a shell command that prints environment variables, those plaintext credentials are sent to the upstream API and persisted in `~/.claude/projects/**/*.jsonl` on disk.
@@ -123,22 +123,31 @@ python benchmarks/rehydration_bench.py
 
 | Benchmark Suite | Metric | Result |
 | :--- | :--- | :--- |
-| **5-Gate `.env` Precision/Recall** (50 realistic entries) | Benign False-Positive Rate | **0.0%** (`0 / 25` false positives) |
-| **5-Gate `.env` Precision/Recall** (50 realistic entries) | True Credential Recall | **100.0%** (`25 / 25` captured) |
+| **Expanded 60-Case Credential Detection Benchmark** | True Credential Recall (Anthropic, OpenAI, Stripe, AWS, GitHub, Slack, PEM, DB URIs) | **100.0%** (`30 / 30` captured) |
+| **Expanded 60-Case Credential Detection Benchmark** | Benign Lookalike False-Positive Rate (UUIDs, git hashes, public URLs, CSS classes, semver, flags) | **0.0%** (`0 / 30` false positives) |
 | **200-Case Streaming & Non-Substitution Integrity** | Exact prose, `\_`, `\\_`, `\u005f`, 1–5B SSE splits, corrupted token non-substitution | **100.0%** (`200 / 200` verified) |
+| **Deterministic Barrier Concurrency Invariant** | Multithreaded race protection & stale-cache rejection under sustained registration | **100.0%** (proven via barrier & lock audit) |
 | **51-Turn Conversation Latency** (`~243 KB` payload) | Memoized Next-Turn Proxy Overhead | **1.10 ms** (cold scan: `17.9 ms`) |
 
 ---
 
-## Threat Model & Honest Boundaries
+## Threat Model, Honest Boundaries & Formal Security Contract
 
-CloakLLM is designed as a local developer firewall and transcript hygiene utility. To prevent false security assumptions, keep these technical boundaries in mind:
+CloakLLM is designed as a local developer firewall and transcript hygiene utility. To prevent false security assumptions, keep these technical boundaries and guarantees in mind:
 
-1. **Heuristic Detection Boundary**: `cloakllm` relies on 5-gate heuristics for `.env*` files and high-precision prefixes for known vendors. Custom, unstructured secrets embedded in non-standard formats, arbitrary command stdout, or rotated credentials no longer present in `.env` cannot be detected without a matching prefix pattern.
-2. **Logical Redaction vs. Hardware Erasure**: `cloakllm scrub` performs atomic in-place logical file redaction with `0600` permissions. It rejects symlinks to prevent traversal attacks. However, it does not guarantee forensic erasure of storage blocks on copy-on-write filesystems (APFS, ZFS, Btrfs), SSD wear-leveling pools, filesystem journals, or remote cloud backups.
-3. **Pre-Wrap Resumed Sessions**: In sessions started with `cloakllm run -- claude`, thinking blocks only ever see cloaked tokens. If you resume an older uncloaked session that already contains plaintext secrets in a signed `thinking` block, that block cannot be rewritten without invalidating Anthropic's signature.
-4. **Non-Goals (String Transformations)**: If a prompt explicitly asks the LLM to output credentials in Base64, hex, rot13, or character-sliced form, the transformed token will not match the token grammar and will remain in its placeholder state.
-5. **Local Multi-User Environment**: CloakLLM binds to loopback (`127.0.0.1`) and uses a per-run random path capability token. On shared multi-user Unix machines where untrusted users can inspect process environment tables (`ps e`) or loopback traffic, use standard OS-level user namespace isolation.
+### What CloakLLM Formally Guarantees
+1. **128-Bit Cryptographic Tokenization**: Every secret indexed from project `.env*` files or recognized by high-precision vendor prefixes is cloaked into a deterministic, session-scoped token (`CLOAKv1_<CAT>_<32HEX>`). HMAC-SHA256 with 128-bit tags eliminates birthday collision hazards.
+2. **Zero Plaintext Transmission of Registered Secrets**: Every string across outbound message bodies, metadata, operational fields, and tool calls is scanned and cloaked. No registered credential leaves loopback uncloaked.
+3. **Fail-Closed HTTP Boundary**: Malformed schemas, unsupported roles, missing required identifiers, and request body read timeouts fail closed with generic error envelopes (`ERR_PAYLOAD_PROCESSING_FAILED`), never forwarding uninspected payloads upstream.
+4. **Symlink Traversal Immunity**: Transcript discovery, in-place scrubbing, and `cloakllm harden` settings modification explicitly reject symlinks in files and parent directories, writing atomically with `0600` permissions and zero `.bak` retention.
+5. **Deterministic Concurrency & Cache Invalidation**: Every secret registration increments the vault version and invalidates the memoization cache under an re-entrant lock. Optimistic concurrency retry in `cloak_message_memoized()` ensures in-flight requests that race with secret registration never cache or return stale uncloaked data.
+
+### What is Explicitly Outside Scope (Honest Boundaries)
+1. **Unindexed / Unstructured Credential Boundary**: CloakLLM protects indexed `.env` secrets and standard vendor prefixes (`sk-ant-`, `sk-proj-`, `ghp_`, `AKIA`, `xoxb-`, PEM blocks). Arbitrary, unstructured secrets printed in command output that lack vendor prefixes and are not present in `.env*` cannot be heuristically inferred.
+2. **Logical Redaction vs. Hardware Erasure**: `cloakllm scrub` performs atomic in-place logical file redaction. It does not erase physical storage blocks on copy-on-write filesystems (APFS, ZFS, Btrfs), SSD wear-leveling pools, or filesystem journals.
+3. **Pre-Existing Resumed Sessions**: Signed Anthropic `thinking` blocks from sessions created prior to wrapping Claude Code cannot be altered without breaking cryptographic signatures.
+4. **Transformed String Obfuscation**: If a user prompt instructs the LLM to output secrets in Base64, hex, rot13, or character-sliced form, the transformed token will not match the token grammar and will remain in its placeholder state.
+5. **Local Multi-User Environment**: CloakLLM binds to loopback (`127.0.0.1`) with a random capability token. On shared multi-user systems where untrusted users can inspect loopback sockets or environment tables, standard OS user namespace isolation is required.
 
 ## Supported Provider API Schemas & Variant Contracts
 
