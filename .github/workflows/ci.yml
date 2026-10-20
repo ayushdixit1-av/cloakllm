@@ -64,52 +64,7 @@ jobs:
 
       - name: Verify package contents and compute SHA-256 checksums
         run: |
-          echo "### Release Artifact Checksums & Reproducibility" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifact | SHA-256 (Build 1) | Size | Rebuild Match |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
-          MISMATCH=0
-          for f in dist/*; do
-            NAME=$(basename "$f")
-            if [ ! -f "dist_rebuild/$NAME" ]; then
-              echo "::error::Missing artifact in rebuild: dist_rebuild/$NAME"
-              exit 1
-            fi
-            HASH1=$(sha256sum "dist/$NAME" | cut -d' ' -f1)
-            HASH2=$(sha256sum "dist_rebuild/$NAME" | cut -d' ' -f1)
-            SIZE=$(stat -c%s "dist/$NAME")
-            if [ "$HASH1" = "$HASH2" ]; then
-              MATCH="PASSED (Deterministic)"
-              echo "PASS: $NAME matches byte-for-byte across builds ($HASH1)"
-            elif [[ "$NAME" == *.whl ]]; then
-              MATCH="FAILED (Wheel Checksum Mismatch)"
-              echo "::error::Binary wheel mismatch for $NAME: Build 1 ($HASH1) != Build 2 ($HASH2)"
-              MISMATCH=1
-            else
-              python -c "
-import tarfile, hashlib, sys
-t1 = tarfile.open('dist/$NAME')
-t2 = tarfile.open('dist_rebuild/$NAME')
-n1, n2 = sorted(t1.getnames()), sorted(t2.getnames())
-if n1 != n2:
-    sys.exit(f'Sdist member list mismatch: {n1} != {n2}')
-for m in n1:
-    f1, f2 = t1.extractfile(m), t2.extractfile(m)
-    if f1 and f2:
-        h1 = hashlib.sha256(f1.read()).hexdigest()
-        h2 = hashlib.sha256(f2.read()).hexdigest()
-        if h1 != h2:
-            sys.exit(f'Sdist content mismatch in {m}: {h1} != {h2}')
-print('Sdist internal file contents verified 100% identical byte-for-byte')
-"
-              MATCH="PASSED (Content Deterministic; gzip container metadata variance documented)"
-              echo "PASS: $NAME internal code and manifests verified 100% identical byte-for-byte"
-            fi
-            echo "| \`$NAME\` | \`$HASH1\` | $SIZE bytes | $MATCH |" >> $GITHUB_STEP_SUMMARY
-          done
-          if [ "$MISMATCH" -ne 0 ]; then
-            echo "::error::Reproducibility release gate failed: binary wheel was not deterministic"
-            exit 1
-          fi
+          python scripts/verify_reproducibility.py dist dist_rebuild
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
