@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import select
 import socket
 import ssl
 import stat
@@ -865,16 +866,25 @@ class CloakProxyServer:
                 },
             }
         ).encode("utf-8")
-        # If the request body has not yet been read, drain up to 64KB so TCP shutdown does not send RST on Windows
+        # Bounded non-blocking drain of unread bytes in buffer (up to 64KB) to ensure graceful TCP FIN shutdown on Windows
         if not getattr(handler, "_body_read", False):
-            try:
-                cl_header = handler.headers.get("Content-Length")
-                if cl_header:
-                    cl = int(cl_header)
-                    if 0 < cl <= 65536:
-                        handler.rfile.read(cl)
-            except Exception:
-                pass
+            if status != 408 and handler.connection is not None:
+                try:
+                    cl_header = handler.headers.get("Content-Length")
+                    if cl_header:
+                        cl = min(int(cl_header), 65536)
+                        if cl > 0:
+                            handler.connection.settimeout(0.05)
+                            while cl > 0:
+                                r, _, _ = select.select([handler.connection], [], [], 0)
+                                if not r:
+                                    break
+                                chunk = handler.rfile.read(min(cl, 4096))
+                                if not chunk:
+                                    break
+                                cl -= len(chunk)
+                except Exception:
+                    pass
             handler._body_read = True
 
         try:
