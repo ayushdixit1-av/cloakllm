@@ -42,3 +42,6 @@ cloakllm = "cloakllm.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cloakllm*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
