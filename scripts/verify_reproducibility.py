@@ -34,8 +34,18 @@ def main() -> int:
         print(f"Error: Build directories not found: {dist1}, {dist2}", file=sys.stderr)
         return 1
 
-    files1 = sorted([f for f in dist1.iterdir() if f.is_file()], key=lambda p: p.name)
-    files2 = sorted([f for f in dist2.iterdir() if f.is_file()], key=lambda p: p.name)
+    entries1 = sorted(dist1.iterdir(), key=lambda p: p.name)
+    entries2 = sorted(dist2.iterdir(), key=lambda p: p.name)
+
+    # Reject non-regular entries (subdirectories, symlinks, sockets)
+    non_regular1 = [e.name for e in entries1 if not e.is_file() or e.is_symlink()]
+    non_regular2 = [e.name for e in entries2 if not e.is_file() or e.is_symlink()]
+    if non_regular1 or non_regular2:
+        print(f"Error: Non-regular entries (directories/symlinks) found in dist: {non_regular1 or non_regular2}", file=sys.stderr)
+        return 1
+
+    files1 = entries1
+    files2 = entries2
 
     names1 = [f.name for f in files1]
     names2 = [f.name for f in files2]
@@ -53,19 +63,9 @@ def main() -> int:
     tar_files = [n for n in names1 if n.endswith(".tar.gz")]
     extra_files = [n for n in names1 if not (n.endswith(".whl") or n.endswith(".tar.gz"))]
 
-    mismatch = False
-
-    if len(whl_files) != 1:
-        print(f"Error: Expected exactly 1 wheel file, found {len(whl_files)}: {whl_files}", file=sys.stderr)
-        mismatch = True
-
-    if len(tar_files) != 1:
-        print(f"Error: Expected exactly 1 sdist file (.tar.gz), found {len(tar_files)}: {tar_files}", file=sys.stderr)
-        mismatch = True
-
-    if extra_files:
-        print(f"Error: Unexpected extra artifacts found in build: {extra_files}", file=sys.stderr)
-        mismatch = True
+    if len(whl_files) != 1 or len(tar_files) != 1 or extra_files:
+        print(f"Error: Invalid artifact set. Wheels: {whl_files}, Sdist: {tar_files}, Extra: {extra_files}", file=sys.stderr)
+        return 1
 
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     summary_lines = [
@@ -73,6 +73,8 @@ def main() -> int:
         "| Artifact | SHA-256 (Build 1) | Size | Rebuild Match |",
         "| :--- | :--- | :--- | :--- |",
     ]
+
+    mismatch = False
 
     for f1 in files1:
         f2 = dist2 / f1.name
@@ -93,18 +95,32 @@ def main() -> int:
             print(f"FAIL: Wheel checksum mismatch: {h1} != {h2}", file=sys.stderr)
             mismatch = True
         elif f1.name.endswith(".tar.gz"):
-            # Check every file inside the tar archive with strict exception handling
+            # Check every file inside the tar archive with strict safety & exception handling
             try:
                 with tarfile.open(f1, "r:gz") as t1, tarfile.open(f2, "r:gz") as t2:
-                    tnames1 = sorted(t1.getnames())
-                    tnames2 = sorted(t2.getnames())
-                    if tnames1 != tnames2:
-                        print(f"FAIL: Sdist member mismatch:\nBuild 1: {tnames1}\nBuild 2: {tnames2}", file=sys.stderr)
+                    members1 = t1.getmembers()
+                    members2 = t2.getmembers()
+                    tnames1 = [m.name for m in members1]
+                    tnames2 = [m.name for m in members2]
+
+                    # Enforce member name uniqueness
+                    if len(tnames1) != len(set(tnames1)) or len(tnames2) != len(set(tnames2)):
+                        print("FAIL: Duplicate member names detected in sdist tar archive", file=sys.stderr)
+                        mismatch = True
+
+                    # Enforce safe member paths (no traversal '..', no absolute paths)
+                    for m in members1 + members2:
+                        if m.name.startswith(("/", "\\")) or ".." in Path(m.name).parts:
+                            print(f"FAIL: Unsafe member path in archive: '{m.name}'", file=sys.stderr)
+                            mismatch = True
+
+                    if sorted(tnames1) != sorted(tnames2):
+                        print(f"FAIL: Sdist member mismatch:\nBuild 1: {sorted(tnames1)}\nBuild 2: {sorted(tnames2)}", file=sys.stderr)
                         status = "FAILED (Member List Mismatch)"
                         mismatch = True
                     else:
                         tar_mismatch = False
-                        for m in tnames1:
+                        for m in sorted(tnames1):
                             ef1 = t1.extractfile(m)
                             ef2 = t2.extractfile(m)
                             if ef1 and ef2:
@@ -117,6 +133,7 @@ def main() -> int:
                             elif bool(ef1) != bool(ef2):
                                 print(f"FAIL: Sdist member extraction difference in '{m}'", file=sys.stderr)
                                 tar_mismatch = True
+                                break
                                 break
                         if tar_mismatch:
                             status = "FAILED (Content Mismatch)"

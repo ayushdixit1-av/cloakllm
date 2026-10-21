@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/ayushdixit1-av/credcloak?include_prereleases&color=orange&label=release)](https://github.com/ayushdixit1-av/credcloak/releases)
 [![CI Matrix](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-50%20passed%20%7C%209%2F9%20CI%20jobs-brightgreen)](#reproducible-benchmarks)
+[![Tests](https://img.shields.io/badge/tests-56%20passed%20%7C%209%2F9%20CI%20jobs-brightgreen)](#reproducible-benchmarks)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#quickstart-30-seconds-zero-dependencies)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/ayushdixit1-av/credcloak)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -130,6 +130,7 @@ python benchmarks/rehydration_bench.py
 | **Expanded 60-Case Credential Detection Benchmark** | Benign Lookalike False-Positive Rate (UUIDs, git hashes, public URLs, CSS classes, semver, flags) | **0.0%** (`0 / 30` false positives) |
 | **200-Case Streaming & Non-Substitution Integrity** | Exact prose, `\_`, `\\_`, `\u005f`, 1–5B SSE splits, corrupted token non-substitution | **100.0%** (`200 / 200` verified) |
 | **Deterministic Barrier Concurrency Invariant** | Multithreaded race protection & stale-cache rejection under sustained registration | **100.0%** (proven via barrier & lock audit) |
+| **Phase 02 Adversarial & Real-Client Suite** | Multi-turn tool calling loop, forged probe rejection, unsupported route isolation, 25-level deep JSON nesting | **100.0%** (`56 / 56` tests passed) |
 | **51-Turn Conversation Latency** (`~243 KB` payload) | Memoized Next-Turn Proxy Overhead | **1.10 ms** (cold scan: `17.9 ms`) |
 
 ---
