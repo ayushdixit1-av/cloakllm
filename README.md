@@ -1,21 +1,60 @@
 # CredCloak (`credcloak`)
 
-**Audit what Claude Code already leaked in `~/.claude` — and cloak your project secrets in real time before they ever leave your machine.**
+> **Active Credential Firewall & Transcript Hygiene for AI Coding Agents**  
+> *Audit historical `~/.claude` leaks, harden agent permissions, and cloak project `.env` secrets in real time before they ever hit the wire.*
 
-[![Release](https://img.shields.io/github/v/release/ayushdixit1-av/credcloak?include_prereleases&color=orange&label=release)](https://github.com/ayushdixit1-av/credcloak/releases)
+[![PyPI Version](https://img.shields.io/pypi/v/credcloak?color=blue&label=pypi)](https://pypi.org/project/credcloak/)
 [![CI Matrix](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-56%20passed%20%7C%209%2F9%20CI%20jobs-brightgreen)](#reproducible-benchmarks)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#quickstart-30-seconds-zero-dependencies)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/ayushdixit1-av/credcloak)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Every time Claude Code reads a config file, inspects test output, or runs a shell command that prints environment variables, those plaintext credentials are sent to the upstream API and persisted in `~/.claude/projects/**/*.jsonl` on disk.
+---
 
-**CredCloak** is a zero-dependency, local-first credential firewall for Claude Code with three layers of defense:
+### The Problem: AI Agents Silently Exfiltrate `.env` Secrets
+When Claude Code or any AI coding assistant reads a project directory, inspects a failing test, or runs a command like `env` or `psql`, it captures raw database passwords, Stripe keys, and API tokens. Those credentials:
+1. **Get sent plaintext to external LLM servers** (`api.anthropic.com` / `api.openai.com`) across network requests.
+2. **Get saved unencrypted in local session history** (`~/.claude/projects/**/*.jsonl`) on disk forever.
 
-1. **`credcloak audit` & `credcloak scrub` (100% Offline, Stdlib-Only)**: Scan your local `~/.claude` transcripts against your project `.env*` files and high-precision credential prefixes (`sk-ant-`, `sk-proj-`, `ghp_`, `AKIA`, `xoxb-`, PEM blocks). Atomically redact historical leaks in-place (`0600` permissions, zero `.bak` files left behind).
-2. **`credcloak harden`**: Inject `Read(./.env)` / `Read(**/*.pem)` deny rules into `.claude/settings.json` while keeping `.env.example` readable.
-3. **`credcloak run -- claude` (Fail-Closed Bidirectional Cloaking Proxy)**: Replaces every secret in outbound `/v1/messages` and `/v1/messages/count_tokens` requests with deterministic, 128-bit session-scoped placeholders (`CLOAKv1_<CATEGORY>_<32HEX>`) and seamlessly rehydrates them in inbound SSE `text_delta` and `input_json_delta` tool-call streams before they reach Claude Code.
+As confirmed in real-world bug reports (e.g. Anthropic Issue #59094 where Claude Code exfiltrated live brokerage keys from a `.env` file), static repo scanners cannot solve this because they only scan static files at rest — they **do not intercept live LLM tool execution**.
+
+### The Solution: Active Bidirectional Cloaking Proxy
+**CredCloak** acts as a local "credential shield" for your AI workflow:
+- **Outbound**: Automatically rewrites registered `.env` passwords to opaque 128-bit HMAC tags (`CLOAKv1_DB_9F2A1C04...`). Upstream LLMs only ever see placeholders.
+- **Inbound**: Seamlessly rehydrates placeholders back to real credentials in streaming tool calls *locally on your machine* so tests, bash commands, and migrations execute normally without ever exposing secrets to the model.
+
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 BEFORE CREDCLOAK                                       │
+│  Claude Code reads .env ──────► POST api.anthropic.com (Plaintext AWS/Stripe Keys)     │
+│                                      │                                                 │
+│                                      ▼ Leaked in remote API logs & ~/.claude on disk   │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                 WITH CREDCLOAK                                         │
+│  Claude Code reads .env ──────► CredCloak Proxy (Rewrites to CLOAKv1_AWS_9F2A...)     │
+│                                      │                                                 │
+│                                      ▼ Outbound to API: Zero Plaintext Secrets         │
+│                                 api.anthropic.com receives only opaque placeholders    │
+│                                      │                                                 │
+│                                      ▼ Inbound Tool Stream: Restored locally on loopback│
+│  Local Tool Execution (bash/db) succeeds with real credentials                         │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why CredCloak? (Comparison with Existing Tools)
+
+| Capability | TruffleHog / Gitleaks | LLM-Secrets | "Secret Detection" Skills | CredCloak |
+| :--- | :---: | :---: | :---: | :---: |
+| **At-Rest Git & File Scanning** | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: (`credcloak audit`) |
+| **Atomic In-Place Redaction** | :x: (Alerts only) | :x: | :x: | :white_check_mark: (`credcloak scrub`) |
+| **Agent Configuration Hardening** | :x: | :x: | :x: | :white_check_mark: (`credcloak harden`) |
+| **Active Loopback Network Proxy** | :x: | :x: | :x: | :white_check_mark: (`credcloak run`) |
+| **In-Flight Outbound Tokenization** | :x: | :x: | :x: | :white_check_mark: (128-bit HMAC) |
+| **SSE Tool-Call Rehydration** | :x: | :x: | :x: | :white_check_mark: (Live streaming) |
+| **Runtime Dependencies** | Go / Python dependencies | Rust / OS Passkeys | Closed / Third-party | **Zero (100% Python Stdlib)** |
 
 ---
 
