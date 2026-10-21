@@ -34,10 +34,38 @@ def main() -> int:
         print(f"Error: Build directories not found: {dist1}, {dist2}", file=sys.stderr)
         return 1
 
-    files1 = sorted(dist1.glob("*"))
+    files1 = sorted([f for f in dist1.iterdir() if f.is_file()], key=lambda p: p.name)
+    files2 = sorted([f for f in dist2.iterdir() if f.is_file()], key=lambda p: p.name)
+
+    names1 = [f.name for f in files1]
+    names2 = [f.name for f in files2]
+
     if not files1:
         print(f"Error: No artifacts found in {dist1}", file=sys.stderr)
         return 1
+
+    if names1 != names2:
+        print(f"Error: Asymmetric artifact list between builds:\nBuild 1: {names1}\nBuild 2: {names2}", file=sys.stderr)
+        return 1
+
+    # Verify expected artifacts: strictly one .whl and one .tar.gz
+    whl_files = [n for n in names1 if n.endswith(".whl")]
+    tar_files = [n for n in names1 if n.endswith(".tar.gz")]
+    extra_files = [n for n in names1 if not (n.endswith(".whl") or n.endswith(".tar.gz"))]
+
+    mismatch = False
+
+    if len(whl_files) != 1:
+        print(f"Error: Expected exactly 1 wheel file, found {len(whl_files)}: {whl_files}", file=sys.stderr)
+        mismatch = True
+
+    if len(tar_files) != 1:
+        print(f"Error: Expected exactly 1 sdist file (.tar.gz), found {len(tar_files)}: {tar_files}", file=sys.stderr)
+        mismatch = True
+
+    if extra_files:
+        print(f"Error: Unexpected extra artifacts found in build: {extra_files}", file=sys.stderr)
+        mismatch = True
 
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     summary_lines = [
@@ -45,8 +73,6 @@ def main() -> int:
         "| Artifact | SHA-256 (Build 1) | Size | Rebuild Match |",
         "| :--- | :--- | :--- | :--- |",
     ]
-
-    mismatch = False
 
     for f1 in files1:
         f2 = dist2 / f1.name
@@ -67,35 +93,44 @@ def main() -> int:
             print(f"FAIL: Wheel checksum mismatch: {h1} != {h2}", file=sys.stderr)
             mismatch = True
         elif f1.name.endswith(".tar.gz"):
-            # Check every file inside the tar archive
-            t1 = tarfile.open(f1)
-            t2 = tarfile.open(f2)
-            names1 = sorted(t1.getnames())
-            names2 = sorted(t2.getnames())
-            if names1 != names2:
-                print(f"FAIL: Sdist member mismatch: {names1} != {names2}", file=sys.stderr)
-                status = "FAILED (Member List Mismatch)"
+            # Check every file inside the tar archive with strict exception handling
+            try:
+                with tarfile.open(f1, "r:gz") as t1, tarfile.open(f2, "r:gz") as t2:
+                    tnames1 = sorted(t1.getnames())
+                    tnames2 = sorted(t2.getnames())
+                    if tnames1 != tnames2:
+                        print(f"FAIL: Sdist member mismatch:\nBuild 1: {tnames1}\nBuild 2: {tnames2}", file=sys.stderr)
+                        status = "FAILED (Member List Mismatch)"
+                        mismatch = True
+                    else:
+                        tar_mismatch = False
+                        for m in tnames1:
+                            ef1 = t1.extractfile(m)
+                            ef2 = t2.extractfile(m)
+                            if ef1 and ef2:
+                                ch1 = hashlib.sha256(ef1.read()).hexdigest()
+                                ch2 = hashlib.sha256(ef2.read()).hexdigest()
+                                if ch1 != ch2:
+                                    print(f"FAIL: Sdist content mismatch in member '{m}'", file=sys.stderr)
+                                    tar_mismatch = True
+                                    break
+                            elif bool(ef1) != bool(ef2):
+                                print(f"FAIL: Sdist member extraction difference in '{m}'", file=sys.stderr)
+                                tar_mismatch = True
+                                break
+                        if tar_mismatch:
+                            status = "FAILED (Content Mismatch)"
+                            mismatch = True
+                        else:
+                            status = "PASSED (Content Deterministic; gzip metadata variance documented)"
+                            print(f"PASS: {f1.name} internal code and manifests verified 100% byte-for-byte identical")
+            except Exception as exc:
+                print(f"FAIL: Sdist archive parsing error: {exc}", file=sys.stderr)
+                status = f"FAILED (Archive Parse Error: {exc})"
                 mismatch = True
-            else:
-                tar_mismatch = False
-                for m in names1:
-                    ef1 = t1.extractfile(m)
-                    ef2 = t2.extractfile(m)
-                    if ef1 and ef2:
-                        ch1 = hashlib.sha256(ef1.read()).hexdigest()
-                        ch2 = hashlib.sha256(ef2.read()).hexdigest()
-                        if ch1 != ch2:
-                            print(f"FAIL: Sdist content mismatch in {m}", file=sys.stderr)
-                            tar_mismatch = True
-                            break
-                if tar_mismatch:
-                    status = "FAILED (Content Mismatch)"
-                    mismatch = True
-                else:
-                    status = "PASSED (Content Deterministic; gzip metadata variance documented)"
-                    print(f"PASS: {f1.name} internal code and manifests verified 100% byte-for-byte identical")
         else:
             status = "UNEXPECTED FILE TYPE"
+            print(f"FAIL: Unexpected file type: {f1.name}", file=sys.stderr)
             mismatch = True
 
         summary_lines.append(f"| `{f1.name}` | `{h1}` | {size} bytes | {status} |")
@@ -105,7 +140,7 @@ def main() -> int:
             sf.write("\n".join(summary_lines) + "\n")
 
     if mismatch:
-        print("Release gate failed: Rebuild produced non-deterministic outputs", file=sys.stderr)
+        print("Release gate failed: Rebuild produced non-deterministic or invalid outputs", file=sys.stderr)
         return 1
 
     print("\nALL ARTIFACTS VERIFIED DETERMINISTIC AND REPRODUCIBLE.")

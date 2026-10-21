@@ -73,16 +73,21 @@ jobs:
           path: dist/*
           retention-days: 90
 
-      - name: Test installation in clean isolated environment
+      - name: Test installation and run tests against isolated wheel
         run: |
           python -m venv test_env
           source test_env/bin/activate
-          pip install dist/*.whl
+          pip install dist/*.whl pytest
           credcloak --version
           credcloak audit --help
           credcloak scrub --help
           credcloak harden --help
           credcloak status --help
           credcloak run --help
-          pip install ".[proxy]"
+          # Run test suite against the installed wheel in a separate directory
+          mkdir -p /tmp/isolated_test
+          cp -r tests /tmp/isolated_test/
+          cd /tmp/isolated_test
+          pytest -v -rs tests/
+          cd -
           deactivate

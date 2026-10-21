@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/ayushdixit1-av/credcloak?include_prereleases&color=orange&label=release)](https://github.com/ayushdixit1-av/credcloak/releases)
 [![CI Matrix](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushdixit1-av/credcloak/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-50%20passed%20%7C%208%2F8%20CI%20matrix-brightgreen)](#reproducible-benchmarks)
+[![Tests](https://img.shields.io/badge/tests-50%20passed%20%7C%209%2F9%20CI%20jobs-brightgreen)](#reproducible-benchmarks)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(100%25%20Python%20stdlib)-success)](#quickstart-30-seconds-zero-dependencies)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/ayushdixit1-av/credcloak)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -85,10 +85,10 @@ credcloak status
                                               2. Cloaked Request                        │ 3. Upstream SSE Stream
                                                  `CLOAKv1_DB_9F2A1C04...`               │    Emits `CLOAKv1_DB_...`
                                                  (Prompt-cache stable 128-bit HMAC)     ▼
-                                                                         ┌───────────────────────────────┐
-                                                                         │    api.anthropic.com          │
-                                                                         │    Never sees raw secret      │
-                                                                         └───────────────────────────────┘
+                                                                          ┌───────────────────────────────┐
+                                                                          │    api.anthropic.com          │
+                                                                          │    (Cloaked Request Received) │
+                                                                          └───────────────────────────────┘
 ```
 
 ### Key Engineering Highlights
@@ -138,10 +138,10 @@ python benchmarks/rehydration_bench.py
 
 CredCloak is designed as a local developer firewall and transcript hygiene utility. To prevent false security assumptions, keep these technical boundaries and guarantees in mind:
 
-### What CredCloak Formally Guarantees
+### What CredCloak Guarantees (Tested Security Contract)
 1. **128-Bit Cryptographic Tokenization**: Every secret indexed from project `.env*` files or recognized by high-precision vendor prefixes is cloaked into a deterministic, session-scoped token (`CLOAKv1_<CAT>_<32HEX>`). HMAC-SHA256 with 128-bit tags eliminates birthday collision hazards.
-2. **Zero Plaintext Transmission of Registered Secrets**: Every string across outbound message bodies, metadata, operational fields, and tool calls is scanned and cloaked. No registered credential leaves loopback uncloaked.
-3. **Immutable Block Fail-Closed Security Policy**: If an outbound message contains a plaintext registered secret inside an unmodifiable block (`thinking`, `redacted_thinking`, or blocks bearing a cryptographic `signature`), CredCloak strictly refuses to forward the payload (rejecting fail-closed with HTTP 500 `ERR_PAYLOAD_PROCESSING_FAILED`), guaranteeing that registered credentials are NEVER transmitted plaintext under any block type. Blocks containing non-secret reasoning or cloaked tokens are preserved untouched to protect signature validity.
+2. **Tested Prevention of Registered Plaintext Transmission**: In all supported outbound routes and message schemas, every string across message bodies, metadata, operational fields, and tool calls is scanned against the vault. In all evaluated integration tests and adversarial matrices, registered credentials do not cross the local proxy boundary to upstream endpoints in plaintext.
+3. **Immutable Block Fail-Closed Security Policy**: If an outbound message contains a plaintext registered secret inside an unmodifiable block (`thinking`, `redacted_thinking`, or blocks bearing a cryptographic `signature`), CredCloak strictly refuses to forward the payload (rejecting fail-closed with HTTP 500 `ERR_PAYLOAD_PROCESSING_FAILED`), preventing registered credentials from reaching upstream under any block type. Blocks containing non-secret reasoning or cloaked tokens are preserved untouched to protect signature validity.
 4. **Fail-Closed HTTP Boundary**: Malformed schemas, unsupported roles, missing required identifiers, and request body read timeouts fail closed with generic error envelopes (`ERR_PAYLOAD_PROCESSING_FAILED`), never forwarding uninspected payloads upstream.
 5. **Symlink Traversal Defense**: Transcript discovery, in-place scrubbing, and `credcloak harden` settings modification explicitly reject symlinks in files, parent directories, and all ancestor directories up to the root, writing atomically with `0600` permissions and zero `.bak` retention.
 6. **Deterministic Concurrency & Cache Invalidation**: Every secret registration increments the vault version and invalidates the memoization cache under an re-entrant lock. Optimistic concurrency retry in `cloak_message_memoized()` ensures in-flight requests that race with secret registration never cache or return stale uncloaked data.
@@ -154,6 +154,27 @@ CredCloak is designed as a local developer firewall and transcript hygiene utili
 5. **Permission Setting Fallback**: On operating systems or filesystems that do not support POSIX permission bits (e.g. Windows FAT32/NTFS without POSIX ACL emulation), `os.chmod` failures are handled without crashing, but users must rely on OS user-account isolation.
 6. **Transformed String Obfuscation**: If a user prompt instructs the LLM to output secrets in Base64, hex, rot13, or character-sliced form, the transformed token will not match the token grammar and will remain in its placeholder state.
 7. **Local Multi-User Network Isolation**: CredCloak binds to loopback (`127.0.0.1`) with a random capability token. On shared multi-user systems where untrusted users can inspect loopback sockets or process tables, standard OS user namespace isolation is required.
+
+---
+
+## Supported vs. Unsupported Clients and Routes
+
+| Category | Supported | Details / Behavior |
+| :--- | :--- | :--- |
+| **Claude Code CLI** | :white_check_mark: Supported | Full interactive workflow via `credcloak run -- claude` (sets `ANTHROPIC_BASE_URL`). |
+| **Anthropic SDK / Custom Clients** | :white_check_mark: Supported | Any HTTP client configured with `base_url="http://127.0.0.1:<port>/<token>"`. |
+| **`POST /v1/messages`** | :white_check_mark: Supported | Anthropic Messages API (streaming SSE & non-streaming JSON). |
+| **`POST /v1/messages/count_tokens`** | :white_check_mark: Supported | Anthropic token counting; input cloaked before calculating count. |
+| **`POST /v1/chat/completions`** | :white_check_mark: Supported | OpenAI Chat Completions (streaming SSE & non-streaming JSON). |
+| **`GET /v1/models`** | :white_check_mark: Supported | Pass-through model enumeration. |
+| **Anthropic Batches (`/v1/messages/batches`)** | :x: Unsupported | Blocked fail-closed with `403 Forbidden`. |
+| **File Uploads (`/v1/files`)** | :x: Unsupported | Blocked fail-closed with `403 Forbidden` (multipart binaries cannot be safely inspected). |
+| **WebSockets** | :x: Unsupported | Blocked fail-closed with `403 Forbidden`. |
+| **Arbitrary Unrecognized Routes** | :x: Unsupported | Blocked fail-closed with `403 Forbidden`. |
+| **Path Traversal (`..` in path)** | :x: Blocked | Blocked fail-closed with `400 Bad Request`. |
+| **Missing / Wrong Capability Token** | :x: Blocked | Blocked fail-closed with `403 Forbidden`. |
+
+---
 
 ## Supported Provider API Schemas & Variant Contracts
 

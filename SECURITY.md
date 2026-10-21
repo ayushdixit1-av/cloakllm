@@ -4,10 +4,11 @@
 
 Only the latest release of CredCloak receives active security updates and vulnerability patches.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| Version | Status | Supported | Notes |
+| :--- | :--- | :--- | :--- |
+| `1.0.x` / `1.0.0-rc.*` | Active Evaluation / Stable Candidate | :white_check_mark: | Active focus for security fixes, verification, and audit sign-off. |
+| `0.1.x` | Legacy Release | :warning: | Limited critical security patches during the v1.0 transition. |
+| `< 0.1.0` | Deprecated / Development | :x: | Unsupported. |
 
 ## Reporting a Vulnerability
 
